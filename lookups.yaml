@@ -1,0 +1,65 @@
+# Area ID to speech-ready name mapping.
+# Edit this file to add/change/remove area mappings without code changes.
+# Use phonetic spelling for TTS clarity where needed.
+areas:
+  710: "3rd Floor. Cardiac Step-Down."
+  711: "2nd Floor. Orthopedics."
+  712: "2nd Floor. Med Surge."
+  713: "Step-Down B."
+  714: "3rd Floor. Med Surge."
+  715: "2nd Floor. Gynecology."
+  716: "Radiology."
+  717: "1st Floor. E.R. 2."
+  718: "1st Floor. Infusion."
+  719: "1st Floor. Day Surgery."
+  720: "1st Floor. Pack you."
+  721: "1st Floor. Mammo."
+  722: "2nd Floor. Observation."
+  724: "1st Floor. Infusion 1."
+  726: "1st Floor. Observation."
+  727: "Laboratory."
+  728: "1st Floor. Endoscopy 2."
+  729: "1st Floor. Chest Pain Unit."
+  730: "1st Floor. E.D."
+  731: "4th Floor, I.C.U."
+  732: "3rd Floor. Pediatrics."
+  733: "Progressive Care Unit."
+  735: "3rd Floor. Sleep study unit."
+  736: "M. R. I."
+  780: "X-Ray."
+  791: "Step-Down."
+  792: "3rd Floor. Med West."
+  793: "3rd Floor. Med Surge."
+  794: "Surgery."
+  795: "2nd Floor. Orthopedics East."
+  796: "3rd Floor. Med East."
+  797: "2nd Floor. Heart Center."
+  798: "Pediatrics South."
+  799: "2nd Floor. O. B."
+
+# Default area name when area ID is not found in the table above.
+default_area: "Unknown Area."
+
+# Call purpose substitutions.
+# Keys are substrings searched for in the SIP display name.
+# Values are the speech-ready substitution.
+# Order matters: first match wins.
+call_purposes:
+  "Blue": "Code Blue"
+  "RRT": "Rapid Response Team"
+  "Pink": "Code Pink"
+
+# Default call purpose when no match is found.
+default_purpose: "Code"
+
+# Room number to speech-ready name mapping.
+# When a room number has an entry here, the mapped name is used
+# instead of "Room {number}." in the TTS output.
+# Add entries as needed, e.g.:
+#   208: "Mens' Room"
+#   209: "Womens' Room"
+rooms: {}
+
+# Default room format when room number is not found in the rooms table.
+# Use {room} as a placeholder for the numeric room number.
+default_room_format: "Room {room}."

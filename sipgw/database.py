@@ -1,0 +1,107 @@
+"""SQLite database for call records.
+
+Stores call history for the dashboard. Uses aiosqlite for async access.
+"""
+
+import time
+import logging
+import aiosqlite
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+from .config import DatabaseConfig
+
+logger = logging.getLogger("sipgw.database")
+
+CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    caller_id TEXT NOT NULL,
+    display_name TEXT DEFAULT '',
+    area_number INTEGER,
+    area_name TEXT DEFAULT '',
+    room_number INTEGER,
+    tts_string TEXT DEFAULT '',
+    fusion_status INTEGER,
+    response_time_ms REAL,
+    created_at REAL NOT NULL
+)
+"""
+
+CREATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_calls_created_at ON calls(created_at DESC)
+"""
+
+
+class CallDatabase:
+    """Async SQLite database for storing call records."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._db: Optional[aiosqlite.Connection] = None
+
+    async def initialize(self) -> None:
+        """Open connection and create tables."""
+        db_dir = Path(self.db_path).parent
+        db_dir.mkdir(parents=True, exist_ok=True)
+
+        self._db = await aiosqlite.connect(self.db_path)
+        self._db.row_factory = aiosqlite.Row
+        await self._db.execute(CREATE_TABLE)
+        await self._db.execute(CREATE_INDEX)
+        await self._db.commit()
+        logger.info(f"Database initialized at {self.db_path}")
+
+    async def record_call(
+        self,
+        caller_id: str,
+        display_name: str,
+        area_number: Optional[int],
+        area_name: str,
+        room_number: Optional[int],
+        tts_string: str,
+        fusion_status: Optional[int],
+        response_time_ms: Optional[float],
+    ) -> int:
+        """Insert a call record. Returns the row ID."""
+        now = time.time()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+
+        cursor = await self._db.execute(
+            """INSERT INTO calls
+               (timestamp, caller_id, display_name, area_number, area_name,
+                room_number, tts_string, fusion_status, response_time_ms, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp,
+                caller_id,
+                display_name,
+                area_number,
+                area_name,
+                room_number,
+                tts_string,
+                fusion_status,
+                response_time_ms,
+                now,
+            ),
+        )
+        await self._db.commit()
+        logger.info(f"Recorded call {cursor.lastrowid}: {caller_id} -> {tts_string}")
+        return cursor.lastrowid
+
+    async def get_recent_calls(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieve the most recent call records."""
+        cursor = await self._db.execute(
+            "SELECT * FROM calls ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def close(self) -> None:
+        """Close the database connection."""
+        if self._db:
+            await self._db.close()
+            self._db = None
+            logger.info("Database closed")
