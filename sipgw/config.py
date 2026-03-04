@@ -28,7 +28,7 @@ class FusionConfig:
     base_url: str = "https://api.icmobile.singlewire.com/api"
     token_url: str = "https://api.icmobile.singlewire.com/api/token"
     audience: str = ""
-    scenario_id: str = "YOUR_SCENARIO_ID"
+    scenario_id: str = ""
     scenario_endpoint: str = "/v1/scenario-notifications"
     variable_name: str = "customTTS"
     scenario_field_id: str = ""
