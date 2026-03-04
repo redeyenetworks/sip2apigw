@@ -29,6 +29,7 @@ from .rtp_handler import RTPSilenceStream
 from .config import AppConfig
 
 logger = logging.getLogger("sipgw.sip")
+sip_debug = logging.getLogger("sipgw.sip_debug")
 
 
 @dataclass
@@ -256,6 +257,10 @@ class SIPServer:
         protocol_type: str,
     ):
         """Route an incoming SIP message to the appropriate handler."""
+        # Log raw inbound SIP message
+        sip_debug.info("<<< RECV from %s:%s (%s)\n%s", addr[0], addr[1], protocol_type,
+                        data.decode("utf-8", errors="replace").rstrip())
+
         try:
             msg = parse_sip_message(data)
         except Exception as e:
@@ -385,6 +390,21 @@ class SIPServer:
             ),
             addr, transport, protocol_type,
         )
+
+        if self.config.sip.immediate_bye:
+            # Immediate BYE mode: answer then immediately hang up, no RTP
+            logger.info(
+                f"Call {call_id} answered+BYE (immediate): {caller_display} <{caller_user}> "
+                f"from {addr[0]}:{addr[1]}"
+            )
+            self._send_bye(call)
+            self._free_rtp_port(local_rtp_port)
+            call.state = "terminated"
+            self.calls.pop(call_id, None)
+
+            # Trigger async callback for webhook + DB
+            asyncio.create_task(self._safe_callback(call))
+            return
 
         # Start RTP silence stream
         if remote_rtp_port > 0:
@@ -551,6 +571,9 @@ class SIPServer:
 
     def _send(self, data: bytes, addr, transport, protocol_type: str):
         """Send SIP data via the appropriate transport."""
+        # Log raw outbound SIP message
+        sip_debug.info(">>> SEND to %s:%s (%s)\n%s", addr[0], addr[1], protocol_type,
+                        data.decode("utf-8", errors="replace").rstrip())
         try:
             if protocol_type == "udp":
                 transport.sendto(data, addr)

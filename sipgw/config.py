@@ -18,6 +18,7 @@ class SIPConfig:
     bind_port: int = 5060
     allowed_networks: List[str] = field(default_factory=lambda: ["172.16.0.0/12"])
     call_timeout_seconds: int = 600
+    immediate_bye: bool = False
     rtp_port_range_start: int = 10000
     rtp_port_range_end: int = 20000
 
@@ -49,6 +50,7 @@ class LoggingConfig:
     rotation_time: str = "midnight"
     timezone: str = "America/New_York"
     api_debug_log: bool = True
+    sip_debug_log: bool = True
 
 
 @dataclass

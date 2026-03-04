@@ -133,4 +133,31 @@ def setup_logging(config: Optional[LoggingConfig] = None) -> None:
         api_logger.addHandler(logging.NullHandler())
         root_logger.info("API debug logging disabled")
 
+    # SIP debug log — separate file for detailed SIP message traces
+    sip_logger = logging.getLogger("sipgw.sip_debug")
+    sip_logger.propagate = False
+
+    if config.sip_debug_log and log_dir.exists():
+        sip_log_file = log_dir / "sipgw_sip_debug.log"
+        sip_handler = CompressingTimedRotatingFileHandler(
+            str(sip_log_file),
+            when="midnight",
+            interval=1,
+            backupCount=config.retention_days,
+            retention_days=config.retention_days,
+            atTime=None,
+        )
+        sip_handler.setLevel(logging.DEBUG)
+        sip_formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s]: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        sip_handler.setFormatter(sip_formatter)
+        sip_handler.suffix = "%Y-%m-%d"
+        sip_logger.addHandler(sip_handler)
+        root_logger.info("SIP debug logging enabled -> %s", sip_log_file)
+    elif not config.sip_debug_log:
+        sip_logger.addHandler(logging.NullHandler())
+        root_logger.info("SIP debug logging disabled")
+
     root_logger.info("Logging initialized")

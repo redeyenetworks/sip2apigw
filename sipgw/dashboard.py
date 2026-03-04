@@ -177,6 +177,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 {% endfor %}{% else %}No log file found.{% endif %}</pre>
     </div>
 
+    {% if sip_debug_lines is not none %}
+    <h2 style="color: #4fc3f7; margin-top: 30px; margin-bottom: 10px; font-size: 1.2rem;">SIP Messages Log</h2>
+    <div class="log-panel">
+        <button class="copy-btn" onclick="copyLog(this)">Copy</button>
+        <pre style="background: #0d1117; border: 1px solid #0f3460; border-radius: 8px; padding: 15px; font-size: 0.78rem; line-height: 1.5; overflow-x: auto; max-height: 600px; overflow-y: auto; color: #4fc3f7; white-space: pre-wrap; word-wrap: break-word;">{% if sip_debug_lines %}{% for line in sip_debug_lines %}{{ line }}
+{% endfor %}{% else %}No SIP debug entries yet.{% endif %}</pre>
+    </div>
+    {% endif %}
+
     {% if api_debug_lines is not none %}
     <h2 style="color: #ff9800; margin-top: 30px; margin-bottom: 10px; font-size: 1.2rem;">API Debug Log (Northbound)</h2>
     <div class="log-panel">
@@ -235,7 +244,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
     log_dir = Path(log_config.log_dir) if log_config else Path("/var/log/sipgw")
     log_file = str(log_dir / "sipgw.log")
     api_debug_file = str(log_dir / "sipgw_api_debug.log")
+    sip_debug_file = str(log_dir / "sipgw_sip_debug.log")
     api_debug_enabled = log_config.api_debug_log if log_config else False
+    sip_debug_enabled = log_config.sip_debug_log if log_config else False
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -252,6 +263,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
 
         log_lines = _read_log_tail(log_file)
         api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
+        sip_debug_lines = _read_log_tail(sip_debug_file) if sip_debug_enabled else None
 
         html = template.render(
             calls=calls,
@@ -261,6 +273,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             refresh_seconds=config.auto_refresh_seconds,
             log_lines=log_lines,
             api_debug_lines=api_debug_lines,
+            sip_debug_lines=sip_debug_lines,
         )
         return HTMLResponse(content=html)
 
