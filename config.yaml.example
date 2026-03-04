@@ -1,0 +1,43 @@
+sip:
+  bind_ip: "0.0.0.0"
+  bind_port: 5060
+  allowed_networks:
+    - "172.16.0.0/12"
+    - "127.0.0.0/8"
+    - "10.0.0.0/8"
+  call_timeout_seconds: 600
+  immediate_bye: true
+  rtp_port_range_start: 10000
+  rtp_port_range_end: 20000
+
+fusion:
+  base_url: "https://api.icmobile.singlewire.com/api"
+  token_url: "https://api.icmobile.singlewire.com/api/token"
+  audience: "YOUR_PROVIDER_ID"
+  scenario_id: "YOUR_SCENARIO_ID"
+  scenario_endpoint: "/v1/scenario-notifications"
+  variable_name: "customTTS"
+  scenario_field_id: ""
+  client_id: "YOUR_CLIENT_ID"
+  client_secret: "YOUR_CLIENT_SECRET"
+
+tts:
+  play_count: 3
+  message_preamble: "Attention! Attention! "
+  iteration_preamble: ""
+
+logging:
+  log_dir: "/var/log/sipgw"
+  retention_days: 90
+  rotation_time: "midnight"
+  timezone: "America/New_York"
+  api_debug_log: true
+  sip_debug_log: true
+
+dashboard:
+  port: 8080
+  bind_ip: "0.0.0.0"
+  auto_refresh_seconds: 10
+
+database:
+  path: "/var/lib/sipgw/calls.db"
