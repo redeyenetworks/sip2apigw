@@ -99,6 +99,40 @@ class CallDatabase:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_calls_page(self, page: int = 1, page_size: int = 20, today_only: bool = True) -> tuple:
+        """Retrieve a page of call records.
+
+        Returns (calls_list, total_count, total_pages).
+        If today_only, limits to calls from today (local time).
+        """
+        import time
+        offset = (page - 1) * page_size
+
+        if today_only:
+            today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
+            count_cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM calls WHERE timestamp >= ?",
+                (today_start,),
+            )
+            total = (await count_cursor.fetchone())[0]
+
+            cursor = await self._db.execute(
+                "SELECT * FROM calls WHERE timestamp >= ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (today_start, page_size, offset),
+            )
+        else:
+            count_cursor = await self._db.execute("SELECT COUNT(*) FROM calls")
+            total = (await count_cursor.fetchone())[0]
+
+            cursor = await self._db.execute(
+                "SELECT * FROM calls ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            )
+
+        rows = await cursor.fetchall()
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        return [dict(row) for row in rows], total, total_pages
+
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:

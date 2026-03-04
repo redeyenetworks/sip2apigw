@@ -57,7 +57,8 @@ class LoggingConfig:
 class DashboardConfig:
     port: int = 8080
     bind_ip: str = "0.0.0.0"
-    auto_refresh_seconds: int = 10
+    auto_refresh_seconds: int = 30
+    page_size: int = 20
 
 
 @dataclass

@@ -1,13 +1,12 @@
 """FastAPI dashboard for sipgw.
 
-Provides a web UI showing recent call history with auto-refresh.
-No authentication required.
+Provides a web UI showing call history with pagination, auto-refresh toggle,
+log viewers, and health endpoint. No authentication required.
 """
 
 import logging
-from collections import deque
 from pathlib import Path
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse
 from typing import Optional
 
@@ -22,7 +21,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>sipgw Dashboard</title>
-    <meta http-equiv="refresh" content="{{ refresh_seconds }}">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -31,16 +29,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             color: #e0e0e0;
             padding: 20px;
         }
-        h1 {
-            color: #00d4ff;
-            margin-bottom: 5px;
-            font-size: 1.5rem;
-        }
-        .subtitle {
-            color: #888;
+        h1 { color: #00d4ff; margin-bottom: 5px; font-size: 1.5rem; }
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             margin-bottom: 20px;
-            font-size: 0.85rem;
         }
+        .subtitle { color: #888; font-size: 0.85rem; }
+        .controls {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            font-size: 0.8rem;
+        }
+        .controls label { color: #aaa; }
+        .controls select, .controls input[type=checkbox] { cursor: pointer; }
+        .controls select {
+            background: #16213e;
+            color: #e0e0e0;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            padding: 3px 6px;
+            font-size: 0.8rem;
+        }
+        .refresh-indicator {
+            color: #4caf50;
+            font-size: 0.75rem;
+            margin-left: 4px;
+        }
+        .refresh-indicator.off { color: #666; }
         .stats {
             display: flex;
             gap: 20px;
@@ -85,13 +103,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             padding: 40px;
             color: #666;
         }
-        .log-panel {
-            position: relative;
-            margin-top: 10px;
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 8px;
+            margin-top: 15px;
+            font-size: 0.85rem;
         }
-        .log-panel pre {
-            margin: 0;
+        .pagination a, .pagination span {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 4px;
+            text-decoration: none;
         }
+        .pagination a {
+            background: #16213e;
+            color: #00d4ff;
+            border: 1px solid #0f3460;
+        }
+        .pagination a:hover { background: #0f3460; }
+        .pagination .current {
+            background: #0f3460;
+            color: #fff;
+            border: 1px solid #00d4ff;
+        }
+        .pagination .disabled {
+            color: #444;
+            border: 1px solid #2a2a3e;
+            background: #16213e;
+        }
+        .log-panel { position: relative; margin-top: 10px; }
+        .log-panel pre { margin: 0; }
         .copy-btn {
             position: absolute;
             top: 8px;
@@ -111,12 +154,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>sipgw Dashboard</h1>
-    <p class="subtitle">Auto-refresh every {{ refresh_seconds }}s &bull; {{ total_calls }} total calls</p>
+    <div>
+        <h1>sipgw Dashboard</h1>
+    </div>
+    <div class="header-row">
+        <div class="subtitle">
+            Showing {{ calls|length }} of {{ total_calls }} calls (today)
+            &bull; Page {{ page }} of {{ total_pages }}
+        </div>
+        <div class="controls">
+            <label>
+                <input type="checkbox" id="autoRefresh" {% if auto_refresh %}checked{% endif %}>
+                Auto-refresh
+            </label>
+            <select id="refreshInterval">
+                {% for val in [10, 30, 60, 120, 300] %}
+                <option value="{{ val }}" {% if refresh_seconds == val %}selected{% endif %}>{{ val }}s</option>
+                {% endfor %}
+            </select>
+            <span id="refreshStatus" class="refresh-indicator {% if not auto_refresh %}off{% endif %}">
+                {% if auto_refresh %}&#9679; ON{% else %}&#9675; OFF{% endif %}
+            </span>
+        </div>
+    </div>
 
     <div class="stats">
         <div class="stat-card">
-            <div class="label">Total Calls</div>
+            <div class="label">Today's Calls</div>
             <div class="value">{{ total_calls }}</div>
         </div>
         <div class="stat-card">
@@ -170,6 +234,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </tbody>
     </table>
 
+    {% if total_pages > 1 %}
+    <div class="pagination">
+        {% if page > 1 %}
+            <a href="?page={{ page - 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">&laquo; Prev</a>
+        {% else %}
+            <span class="disabled">&laquo; Prev</span>
+        {% endif %}
+
+        {% for p in range(1, total_pages + 1) %}
+            {% if p == page %}
+                <span class="current">{{ p }}</span>
+            {% elif p <= 3 or p > total_pages - 2 or (p >= page - 1 and p <= page + 1) %}
+                <a href="?page={{ p }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">{{ p }}</a>
+            {% elif p == 4 and page > 5 %}
+                <span class="disabled">&hellip;</span>
+            {% elif p == total_pages - 2 and page < total_pages - 4 %}
+                <span class="disabled">&hellip;</span>
+            {% endif %}
+        {% endfor %}
+
+        {% if page < total_pages %}
+            <a href="?page={{ page + 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">Next &raquo;</a>
+        {% else %}
+            <span class="disabled">Next &raquo;</span>
+        {% endif %}
+    </div>
+    {% endif %}
+
     <h2 style="color: #00d4ff; margin-top: 30px; margin-bottom: 10px; font-size: 1.2rem;">Recent Logs</h2>
     <div class="log-panel">
         <button class="copy-btn" onclick="copyLog(this)">Copy</button>
@@ -207,6 +299,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             }, 2000);
         });
     }
+
+    // Auto-refresh logic
+    var autoCheck = document.getElementById('autoRefresh');
+    var intervalSelect = document.getElementById('refreshInterval');
+    var statusSpan = document.getElementById('refreshStatus');
+    var timer = null;
+
+    function buildUrl() {
+        var params = new URLSearchParams(window.location.search);
+        params.set('auto', autoCheck.checked ? '1' : '0');
+        params.set('refresh', intervalSelect.value);
+        // Stay on page 1 when auto-refreshing
+        if (autoCheck.checked) params.set('page', '1');
+        return '?' + params.toString();
+    }
+
+    function startRefresh() {
+        stopRefresh();
+        if (autoCheck.checked) {
+            var secs = parseInt(intervalSelect.value);
+            timer = setTimeout(function() { window.location.href = buildUrl(); }, secs * 1000);
+            statusSpan.innerHTML = '&#9679; ON';
+            statusSpan.className = 'refresh-indicator';
+        } else {
+            statusSpan.innerHTML = '&#9675; OFF';
+            statusSpan.className = 'refresh-indicator off';
+        }
+    }
+
+    function stopRefresh() {
+        if (timer) { clearTimeout(timer); timer = null; }
+    }
+
+    autoCheck.addEventListener('change', startRefresh);
+    intervalSelect.addEventListener('change', startRefresh);
+
+    // Initialize
+    startRefresh();
     </script>
 </body>
 </html>"""
@@ -249,9 +379,16 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
     sip_debug_enabled = log_config.sip_debug_log if log_config else False
 
     @app.get("/", response_class=HTMLResponse)
-    async def index():
-        calls = await db.get_recent_calls(limit=200)
-        total = len(calls)
+    async def index(
+        page: int = Query(1, ge=1),
+        auto: int = Query(0, ge=0, le=1),
+        refresh: int = Query(config.auto_refresh_seconds),
+    ):
+        page_size = config.page_size
+        calls, total_calls, total_pages = await db.get_calls_page(
+            page=page, page_size=page_size, today_only=True,
+        )
+
         success = sum(
             1 for c in calls
             if c.get("fusion_status") and 200 <= c["fusion_status"] < 300
@@ -265,12 +402,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
         sip_debug_lines = _read_log_tail(sip_debug_file) if sip_debug_enabled else None
 
+        # Clamp refresh to allowed values
+        if refresh not in (10, 30, 60, 120, 300):
+            refresh = config.auto_refresh_seconds
+
         html = template.render(
             calls=calls,
-            total_calls=total,
+            total_calls=total_calls,
             success_calls=success,
             failed_calls=failed,
-            refresh_seconds=config.auto_refresh_seconds,
+            page=page,
+            total_pages=total_pages,
+            auto_refresh=bool(auto),
+            refresh_seconds=refresh,
             log_lines=log_lines,
             api_debug_lines=api_debug_lines,
             sip_debug_lines=sip_debug_lines,

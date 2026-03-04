@@ -37,7 +37,8 @@ logging:
 dashboard:
   port: 8080
   bind_ip: "0.0.0.0"
-  auto_refresh_seconds: 10
+  auto_refresh_seconds: 30
+  page_size: 20
 
 database:
   path: "/var/lib/sipgw/calls.db"
