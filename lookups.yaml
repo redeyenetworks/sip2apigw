@@ -49,8 +49,8 @@ call_purposes:
   "RRT": "Rapid Response Team"
   "Pink": "Code Pink"
 
-# Default call purpose when no match is found.
-default_purpose: "Code"
+# Default call purpose when no match is found.  Default to most critical to be safe.
+default_purpose: "Code Blue"
 
 # Room number to speech-ready name mapping.
 # When a room number has an entry here, the mapped name is used
