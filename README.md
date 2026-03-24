@@ -51,7 +51,7 @@ This is delivered as TTS audio (12.8 seconds) to all IP speakers in the configur
 - **Area+Room combo overrides** — Same room number, different name per area (e.g., room 2201 = "Prepost 1" in Heart Center, "Room 2201" in Ortho East).
 - **Fusion integration** — OAuth2 client credentials with token caching, field-based scenario trigger.
 - **Auto field resolution** — Discovers the Fusion scenario field UUID automatically on first call.
-- **Hot-reload lookups** — `lookups.yaml` changes detected automatically, no restart needed.
+- **Hot-reload lookups** — `lookups.yaml` changes detected on next SIP call or page load, no restart needed.
 - **Verify lookups button** — Dashboard button validates YAML with detailed error reporting + sample download.
 - **Web dashboard** — Dark-themed, auto-refreshing call history with stats at `:8080`.
 - **3 debug logs** — Application log, SIP messages log, API debug log — all viewable on dashboard with Copy buttons.
@@ -143,7 +143,7 @@ All settings are in `config.yaml`. Full reference in [docs/SIPGW_SERVICE_MANUAL.
 
 ## Lookup Tables
 
-`lookups.yaml` maps SIP caller data to speech-ready names. **Changes are hot-reloaded automatically** — no restart needed. Use the "Verify lookups.yaml" button on the dashboard to validate after editing.
+`lookups.yaml` maps SIP caller data to speech-ready names. **Changes are hot-reloaded automatically** — no restart needed. The file's mtime is checked on every lookup (SIP call or dashboard page load). Reload is confirmed by a log entry in `sipgw.log`. Use the "Verify lookups.yaml" button on the dashboard to validate after editing (clicking it also triggers the reload).
 
 ```yaml
 # Area ID → spoken name (use "..." for TTS pauses)

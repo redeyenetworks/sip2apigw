@@ -493,7 +493,16 @@ database:
 
 Lookup tables are loaded from `lookups.yaml`. The default path is `/opt/sipgw/lookups.yaml`, which can be overridden by setting the `SIPGW_LOOKUPS` environment variable.
 
-**Changes to `lookups.yaml` are hot-reloaded automatically.** The file's modification time is checked on every lookup call. When a change is detected, the file is reloaded and a log entry is written. If the reload fails (e.g., malformed YAML), the previous data is preserved and the error is logged with a full traceback.
+**Changes to `lookups.yaml` are hot-reloaded automatically.** The file's modification time (`mtime`) is checked on every lookup call — that is, each time the service processes a SIP call or the dashboard renders a page that triggers a lookup. When a change is detected, the file is reloaded and two log entries are written to `sipgw.log`:
+
+```
+[INFO] sipgw.lookups: lookups.yaml changed on disk, reloading...
+[INFO] sipgw.lookups: Loaded 34 area, 3 purpose, 0 room, and 211 area+room mappings from /opt/sipgw/lookups.yaml
+```
+
+**Important timing note:** The reload is not instant on file save. It is triggered by the *next* event that performs a lookup (an inbound SIP call or a dashboard page load). If no calls arrive after editing, the reload will not occur until the next call or page view. There is no background polling — the check is piggybacked onto normal lookup operations for zero overhead when the file hasn't changed.
+
+If the reload fails (e.g., malformed YAML or file mid-write), the error is logged with a full traceback and the previous working data is preserved. The service continues operating normally with the last good configuration.
 
 ### 6.1 Complete lookups.yaml Structure
 
@@ -571,8 +580,9 @@ The `rooms` table provides a global fallback for room names that apply regardles
 To add or modify lookup entries:
 
 1. Edit `/opt/sipgw/lookups.yaml` with any text editor.
-2. Save the file — **changes are detected and applied automatically** on the next call. No restart needed.
-3. Use the **"Verify lookups.yaml"** button on the dashboard (`:8080`) to validate your changes.
+2. Save the file — **no restart needed**. The change will be picked up on the next inbound SIP call or dashboard page load.
+3. Use the **"Verify lookups.yaml"** button on the dashboard (`:8080`) to validate your changes. Clicking the button also triggers the reload check, so this is the fastest way to confirm your edit was loaded.
+4. Check `sipgw.log` for the `"lookups.yaml changed on disk, reloading..."` confirmation message.
 
 The verify button checks:
 - YAML syntax validity
