@@ -49,8 +49,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a730r201",
             display_name="Code Blue",
-            area_number=730,
-            room_number=201,
+            area_number="730",
+            room_number="201",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -60,8 +60,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a710r100",
             display_name="Blue Alert",
-            area_number=710,
-            room_number=100,
+            area_number="710",
+            room_number="100",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -71,8 +71,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a731r400",
             display_name="RRT",
-            area_number=731,
-            room_number=400,
+            area_number="731",
+            room_number="400",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -82,8 +82,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a999r100",
             display_name="Blue",
-            area_number=999,
-            room_number=100,
+            area_number="999",
+            room_number="100",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -93,8 +93,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a730r201",
             display_name="",
-            area_number=730,
-            room_number=201,
+            area_number="730",
+            room_number="201",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -104,8 +104,8 @@ class TestBuildTTS:
         caller = CallerInfo(
             raw_user="a710r50",
             display_name="Code Pink",
-            area_number=710,
-            room_number=50,
+            area_number="710",
+            room_number="50",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -124,12 +124,12 @@ class TestBuildTTS:
 
     def test_room_mapping(self):
         """Test that mapped room numbers use the mapped name."""
-        lookups_mod._room_map[208] = "Mens' Room"
+        lookups_mod._room_map["208"] = "Mens' Room"
         caller = CallerInfo(
             raw_user="a730r208",
             display_name="Code Blue",
-            area_number=730,
-            room_number=208,
+            area_number="730",
+            room_number="208",
             parse_success=True,
         )
         result = build_tts(caller)
@@ -137,16 +137,28 @@ class TestBuildTTS:
 
     def test_room_mapping_unmapped_falls_back(self):
         """Test that unmapped room numbers use the default format."""
-        lookups_mod._room_map[208] = "Mens' Room"
+        lookups_mod._room_map["208"] = "Mens' Room"
         caller = CallerInfo(
             raw_user="a730r201",
             display_name="Code Blue",
-            area_number=730,
-            room_number=201,
+            area_number="730",
+            room_number="201",
             parse_success=True,
         )
         result = build_tts(caller)
         assert result == "Code Blue! 1st Floor. E.D. Room 201."
+
+    def test_leading_zeros_preserved(self):
+        """Test that leading zeros in room numbers are preserved."""
+        caller = CallerInfo(
+            raw_user="a730r01196",
+            display_name="Code Blue",
+            area_number="730",
+            room_number="01196",
+            parse_success=True,
+        )
+        result = build_tts(caller)
+        assert result == "Code Blue! 1st Floor. E.D. Room 01196."
 
 
 class TestAssembleTTS:

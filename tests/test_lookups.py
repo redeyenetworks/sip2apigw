@@ -49,19 +49,19 @@ def sample_lookups_file():
 class TestGetAreaName:
     def test_known_area(self, sample_lookups_file):
         load_lookups(sample_lookups_file)
-        assert get_area_name(710) == "3rd Floor. Cardiac Step-Down."
+        assert get_area_name("710") == "3rd Floor. Cardiac Step-Down."
 
     def test_another_known_area(self, sample_lookups_file):
         load_lookups(sample_lookups_file)
-        assert get_area_name(730) == "1st Floor. E.D."
+        assert get_area_name("730") == "1st Floor. E.D."
 
     def test_unknown_area(self, sample_lookups_file):
         load_lookups(sample_lookups_file)
-        assert get_area_name(999) == "Unknown Area."
+        assert get_area_name("999") == "Unknown Area."
 
     def test_icu(self, sample_lookups_file):
         load_lookups(sample_lookups_file)
-        assert get_area_name(731) == "4th Floor, I.C.U."
+        assert get_area_name("731") == "4th Floor, I.C.U."
 
 
 class TestGetCallPurpose:
@@ -101,17 +101,17 @@ class TestGetCallPurpose:
 class TestGetRoomName:
     def test_unmapped_room(self, sample_lookups_file):
         load_lookups(sample_lookups_file)
-        assert get_room_name(201) == "Room 201."
+        assert get_room_name("201") == "Room 201."
 
     def test_mapped_room(self):
-        lookups_mod._room_map = {208: "Mens' Room"}
+        lookups_mod._room_map = {"208": "Mens' Room"}
         lookups_mod._loaded = True
-        assert get_room_name(208) == "Mens' Room."
+        assert get_room_name("208") == "Mens' Room."
 
     def test_mapped_room_unmapped_falls_back(self):
-        lookups_mod._room_map = {208: "Mens' Room"}
+        lookups_mod._room_map = {"208": "Mens' Room"}
         lookups_mod._loaded = True
-        assert get_room_name(300) == "Room 300."
+        assert get_room_name("300") == "Room 300."
 
     def test_room_from_yaml(self):
         data = {
@@ -125,9 +125,9 @@ class TestGetRoomName:
             path = f.name
         try:
             load_lookups(path)
-            assert get_room_name(208) == "Mens' Room."
-            assert get_room_name(209) == "Womens' Room."
-            assert get_room_name(100) == "Room 100."
+            assert get_room_name("208") == "Mens' Room."
+            assert get_room_name("209") == "Womens' Room."
+            assert get_room_name("100") == "Room 100."
         finally:
             os.unlink(path)
 
@@ -135,4 +135,9 @@ class TestGetRoomName:
         lookups_mod._room_map = {}
         lookups_mod._default_room_format = "Rm {room}."
         lookups_mod._loaded = True
-        assert get_room_name(201) == "Rm 201."
+        assert get_room_name("201") == "Rm 201."
+
+    def test_leading_zeros_preserved(self):
+        lookups_mod._room_map = {}
+        lookups_mod._loaded = True
+        assert get_room_name("01196") == "Room 01196."

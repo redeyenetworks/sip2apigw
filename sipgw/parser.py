@@ -23,9 +23,9 @@ class CallerInfo:
     """Parsed caller information from SIP headers."""
     raw_user: str
     display_name: str
-    area_number: Optional[int] = None
-    room_number: Optional[int] = None
-    bed_number: Optional[int] = None
+    area_number: Optional[str] = None
+    room_number: Optional[str] = None
+    bed_number: Optional[str] = None
     parse_success: bool = False
 
 
@@ -46,11 +46,11 @@ def parse_caller_username(raw_user: str) -> tuple:
         logger.warning(f"Username '{raw_user}' (cleaned: '{cleaned}') does not match expected format")
         return None, None, None, False
 
-    area = int(match.group(1)) if match.group(1) else None
-    room = int(match.group(2)) if match.group(2) else None
+    area = match.group(1) if match.group(1) else None
+    room = match.group(2) if match.group(2) else None
     bed = None
     if match.group(3) is not None and match.group(3) != "":
-        bed = int(match.group(3))
+        bed = match.group(3)
 
     return area, room, bed, True
 

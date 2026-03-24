@@ -46,7 +46,7 @@ This is delivered as TTS audio (12.8 seconds) to all IP speakers in the configur
 
 - **SIP UA** — Listens on UDP/TCP port 5060. Handles INVITE, ACK, BYE, CANCEL, OPTIONS.
 - **Immediate BYE mode** — Answer and hang up instantly without RTP (mirrors existing systems).
-- **Caller parsing** — Extracts area, room, bed from SIP username format `a{area}r{room}[b{bed}]`.
+- **Caller parsing** — Extracts area, room, bed from SIP username format `a{area}r{room}[b{bed}]`. Leading zeros preserved (e.g., `r01196` stays `01196`).
 - **Configurable TTS** — Play count (default 3x), message preamble, iteration preamble.
 - **Room mapping** — Override "Room 208" with "Mens' Room" via `lookups.yaml`.
 - **Fusion integration** — OAuth2 client credentials with token caching, field-based scenario trigger.
@@ -57,7 +57,7 @@ This is delivered as TTS audio (12.8 seconds) to all IP speakers in the configur
 - **SQLite history** — All calls recorded with timestamps, parsed data, TTS, Fusion status, response times.
 - **Concurrent calls** — Handles multiple simultaneous SIP calls and webhook triggers.
 - **Security** — IP filtering, systemd hardening, credential masking in logs, XSS-safe dashboard.
-- **105 tests** — Unit, functional, and system-level tests across 9 test files.
+- **112 tests** — Unit, functional, and system-level tests across 9 test files.
 - **Automated backups** — Daily backup to `/home/sipgw/backups/` with 30-day retention.
 
 ---
@@ -276,7 +276,7 @@ RTP silence: 12-byte header + 160 bytes of `0xFF` (u-law silence), 20ms interval
 
 ## Testing
 
-105 tests across 9 files:
+112 tests across 9 files:
 
 ```bash
 /opt/sipgw/venv/bin/python -m pytest tests/ -v
@@ -284,9 +284,9 @@ RTP silence: 12-byte header + 160 bytes of `0xFF` (u-law silence), 20ms interval
 
 | Test File | Count | Coverage |
 |-----------|-------|----------|
-| `test_parser.py` | 11 | SIP username parsing, From header extraction |
-| `test_lookups.py` | 13 | Area, purpose, and room lookups |
-| `test_tts_builder.py` | 16 | TTS building, room mapping, assembly with preambles |
+| `test_parser.py` | 13 | SIP username parsing, From header extraction, leading zeros |
+| `test_lookups.py` | 14 | Area, purpose, and room lookups, leading zeros |
+| `test_tts_builder.py` | 17 | TTS building, room mapping, assembly, leading zeros |
 | `test_sip_message.py` | 10 | SIP message parsing and response building |
 | `test_rtp.py` | 10 | RTP packet construction |
 | `test_webhook.py` | 4 | OAuth2 token handling and scenario triggering |
@@ -359,7 +359,7 @@ Includes all code, config, database, logs, and systemd unit. 30-day retention. S
 │   ├── dashboard.py         # FastAPI web dashboard (Jinja2, autoescape)
 │   ├── config.py            # Typed dataclass config loader
 │   └── logging_config.py    # Logging setup (rotation, compression, debug logs)
-├── tests/                   # 105 tests across 9 files
+├── tests/                   # 112 tests across 9 files
 └── docs/
     └── SIPGW_SERVICE_MANUAL.md  # Comprehensive service manual
 ```
@@ -400,7 +400,8 @@ Includes all code, config, database, logs, and systemd unit. 30-day retention. S
 
 ## Documentation
 
-Full service manual: [docs/SIPGW_SERVICE_MANUAL.md](docs/SIPGW_SERVICE_MANUAL.md)
+- Full service manual: [docs/SIPGW_SERVICE_MANUAL.md](docs/SIPGW_SERVICE_MANUAL.md)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

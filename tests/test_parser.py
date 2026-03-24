@@ -10,35 +10,35 @@ class TestParseCallerUsername:
     def test_basic_area_room(self):
         area, room, bed, ok = parse_caller_username("a710r201")
         assert ok is True
-        assert area == 710
-        assert room == 201
+        assert area == "710"
+        assert room == "201"
         assert bed is None
 
     def test_with_bed(self):
         area, room, bed, ok = parse_caller_username("a710r201b3")
         assert ok is True
-        assert area == 710
-        assert room == 201
-        assert bed == 3
+        assert area == "710"
+        assert room == "201"
+        assert bed == "3"
 
     def test_strips_asterisks(self):
         area, room, bed, ok = parse_caller_username("a*710r*201b*3")
         assert ok is True
-        assert area == 710
-        assert room == 201
-        assert bed == 3
+        assert area == "710"
+        assert room == "201"
+        assert bed == "3"
 
     def test_large_area_number(self):
         area, room, bed, ok = parse_caller_username("a730r100")
         assert ok is True
-        assert area == 730
-        assert room == 100
+        assert area == "730"
+        assert room == "100"
 
     def test_bed_empty_after_b(self):
         area, room, bed, ok = parse_caller_username("a710r201b")
         assert ok is True
-        assert area == 710
-        assert room == 201
+        assert area == "710"
+        assert room == "201"
         assert bed is None
 
     def test_invalid_format_no_prefix(self):
@@ -60,14 +60,29 @@ class TestParseCallerUsername:
     def test_whitespace_handling(self):
         area, room, bed, ok = parse_caller_username("  a710r201  ")
         assert ok is True
-        assert area == 710
-        assert room == 201
+        assert area == "710"
+        assert room == "201"
 
     def test_all_asterisks(self):
         area, room, bed, ok = parse_caller_username("a*7*1*0r*2*0*1")
         assert ok is True
-        assert area == 710
-        assert room == 201
+        assert area == "710"
+        assert room == "201"
+
+    def test_leading_zeros_preserved(self):
+        """Leading zeros in room/area numbers must be preserved."""
+        area, room, bed, ok = parse_caller_username("a730r01196b1")
+        assert ok is True
+        assert area == "730"
+        assert room == "01196"
+        assert bed == "1"
+
+    def test_leading_zeros_with_asterisks(self):
+        area, room, bed, ok = parse_caller_username("a730*r01196*b1")
+        assert ok is True
+        assert area == "730"
+        assert room == "01196"
+        assert bed == "1"
 
 
 class TestParseSipFromHeader:
@@ -112,27 +127,35 @@ class TestParseCaller:
         assert caller.parse_success is True
         assert caller.raw_user == "a730r201"
         assert caller.display_name == "Code Blue"
-        assert caller.area_number == 730
-        assert caller.room_number == 201
+        assert caller.area_number == "730"
+        assert caller.room_number == "201"
         assert caller.bed_number is None
 
     def test_full_parse_with_asterisks(self):
         caller = parse_caller('"Blue" <sip:a*710r*201b*1@172.16.1.100>')
         assert caller.parse_success is True
         assert caller.raw_user == "a*710r*201b*1"
-        assert caller.area_number == 710
-        assert caller.room_number == 201
-        assert caller.bed_number == 1
+        assert caller.area_number == "710"
+        assert caller.room_number == "201"
+        assert caller.bed_number == "1"
 
     def test_full_parse_rrt(self):
         caller = parse_caller('"RRT" <sip:a731r400@172.16.2.50>;tag=xyz')
         assert caller.parse_success is True
         assert caller.display_name == "RRT"
-        assert caller.area_number == 731
-        assert caller.room_number == 400
+        assert caller.area_number == "731"
+        assert caller.room_number == "400"
 
     def test_unparseable_user(self):
         caller = parse_caller('"Code Blue" <sip:unknown@172.16.1.100>')
         assert caller.parse_success is False
         assert caller.raw_user == "unknown"
         assert caller.display_name == "Code Blue"
+
+    def test_leading_zeros_full_parse(self):
+        """Leading zeros preserved through the full parse pipeline."""
+        caller = parse_caller('"Code Blue" <sip:a730*r01196*b1@172.16.1.100>;tag=abc')
+        assert caller.parse_success is True
+        assert caller.area_number == "730"
+        assert caller.room_number == "01196"
+        assert caller.bed_number == "1"

@@ -14,9 +14,9 @@ logger = logging.getLogger("sipgw.lookups")
 DEFAULT_LOOKUPS_PATH = "/opt/sipgw/lookups.yaml"
 
 # Module-level cache
-_area_map: Dict[int, str] = {}
+_area_map: Dict[str, str] = {}
 _purpose_map: Dict[str, str] = {}
-_room_map: Dict[int, str] = {}
+_room_map: Dict[str, str] = {}
 _default_area: str = "Unknown Area."
 _default_purpose: str = "Code"
 _default_room_format: str = "Room {room}."
@@ -37,11 +37,11 @@ def load_lookups(path: Optional[str] = None) -> None:
     with open(lookups_path, "r") as f:
         raw = yaml.safe_load(f) or {}
 
-    _area_map = {int(k): v for k, v in raw.get("areas", {}).items()}
+    _area_map = {str(k): v for k, v in raw.get("areas", {}).items()}
     _default_area = raw.get("default_area", "Unknown Area.")
     _purpose_map = raw.get("call_purposes", {})
     _default_purpose = raw.get("default_purpose", "Code")
-    _room_map = {int(k): v for k, v in raw.get("rooms", {}).items()}
+    _room_map = {str(k): v for k, v in raw.get("rooms", {}).items()}
     _default_room_format = raw.get("default_room_format", "Room {room}.")
     _loaded = True
 
@@ -56,17 +56,18 @@ def _ensure_loaded():
         load_lookups()
 
 
-def get_area_name(area_id: int) -> str:
-    """Look up a speech-ready area name by numeric area ID."""
+def get_area_name(area_id: str) -> str:
+    """Look up a speech-ready area name by area ID string."""
     _ensure_loaded()
     return _area_map.get(area_id, _default_area)
 
 
-def get_room_name(room_number: int) -> str:
-    """Look up a speech-ready room name by numeric room number.
+def get_room_name(room_number: str) -> str:
+    """Look up a speech-ready room name by room number string.
 
     If the room number has a mapping, returns the mapped name followed by a period.
-    Otherwise returns the default format (e.g. "Room 201.").
+    Otherwise returns the default format (e.g. "Room 01196.").
+    Leading zeros from the SIP username are preserved.
     """
     _ensure_loaded()
     if room_number in _room_map:
