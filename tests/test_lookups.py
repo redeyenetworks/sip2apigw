@@ -14,6 +14,7 @@ def reset_lookups():
     lookups_mod._area_map = {}
     lookups_mod._purpose_map = {}
     lookups_mod._room_map = {}
+    lookups_mod._area_room_map = {}
     lookups_mod._default_area = "Unknown Area."
     lookups_mod._default_purpose = "Code"
     lookups_mod._default_room_format = "Room {room}."
@@ -141,3 +142,59 @@ class TestGetRoomName:
         lookups_mod._room_map = {}
         lookups_mod._loaded = True
         assert get_room_name("01196") == "Room 01196."
+
+
+class TestAreaRoomCombo:
+    """Tests for area+room combo override lookups."""
+
+    def test_combo_override_found(self):
+        lookups_mod._area_room_map = {"797*2201": "Prepost 1"}
+        lookups_mod._room_map = {}
+        lookups_mod._loaded = True
+        assert get_room_name("2201", area_number="797") == "Prepost 1."
+
+    def test_combo_override_different_area_falls_through(self):
+        """Same room number in different area has no combo override."""
+        lookups_mod._area_room_map = {"797*2201": "Prepost 1"}
+        lookups_mod._room_map = {}
+        lookups_mod._loaded = True
+        assert get_room_name("2201", area_number="795") == "Room 2201."
+
+    def test_combo_override_takes_priority_over_room_map(self):
+        """Combo override wins over room-only mapping."""
+        lookups_mod._area_room_map = {"797*2201": "Prepost 1"}
+        lookups_mod._room_map = {"2201": "Generic Room Name"}
+        lookups_mod._loaded = True
+        assert get_room_name("2201", area_number="797") == "Prepost 1."
+
+    def test_room_map_used_when_no_combo(self):
+        """Room-only mapping used when no combo override exists."""
+        lookups_mod._area_room_map = {"797*2201": "Prepost 1"}
+        lookups_mod._room_map = {"2201": "Generic Room Name"}
+        lookups_mod._loaded = True
+        assert get_room_name("2201", area_number="795") == "Generic Room Name."
+
+    def test_no_area_falls_to_room_map(self):
+        """When area_number is None, skip combo and use room map."""
+        lookups_mod._area_room_map = {"797*2201": "Prepost 1"}
+        lookups_mod._room_map = {"2201": "Generic Room Name"}
+        lookups_mod._loaded = True
+        assert get_room_name("2201", area_number=None) == "Generic Room Name."
+
+    def test_combo_from_yaml(self):
+        data = {
+            "areas": {},
+            "call_purposes": {},
+            "rooms": {},
+            "area_rooms": {"797*2201": "Prepost 1", "710*3196": "Dialysis"},
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            yaml.dump(data, f)
+            path = f.name
+        try:
+            load_lookups(path)
+            assert get_room_name("2201", area_number="797") == "Prepost 1."
+            assert get_room_name("3196", area_number="710") == "Dialysis."
+            assert get_room_name("2201", area_number="795") == "Room 2201."
+        finally:
+            os.unlink(path)

@@ -48,16 +48,18 @@ This is delivered as TTS audio (12.8 seconds) to all IP speakers in the configur
 - **Immediate BYE mode** — Answer and hang up instantly without RTP (mirrors existing systems).
 - **Caller parsing** — Extracts area, room, bed from SIP username format `a{area}r{room}[b{bed}]`. Leading zeros preserved (e.g., `r01196` stays `01196`).
 - **Configurable TTS** — Play count (default 3x), message preamble, iteration preamble.
-- **Room mapping** — Override "Room 208" with "Mens' Room" via `lookups.yaml`.
+- **Area+Room combo overrides** — Same room number, different name per area (e.g., room 2201 = "Prepost 1" in Heart Center, "Room 2201" in Ortho East).
 - **Fusion integration** — OAuth2 client credentials with token caching, field-based scenario trigger.
 - **Auto field resolution** — Discovers the Fusion scenario field UUID automatically on first call.
+- **Hot-reload lookups** — `lookups.yaml` changes detected automatically, no restart needed.
+- **Verify lookups button** — Dashboard button validates YAML with detailed error reporting + sample download.
 - **Web dashboard** — Dark-themed, auto-refreshing call history with stats at `:8080`.
 - **3 debug logs** — Application log, SIP messages log, API debug log — all viewable on dashboard with Copy buttons.
 - **Log rotation** — Daily rotation at midnight with .tgz compression, 90-day retention.
 - **SQLite history** — All calls recorded with timestamps, parsed data, TTS, Fusion status, response times.
 - **Concurrent calls** — Handles multiple simultaneous SIP calls and webhook triggers.
 - **Security** — IP filtering, systemd hardening, credential masking in logs, XSS-safe dashboard.
-- **112 tests** — Unit, functional, and system-level tests across 9 test files.
+- **120 tests** — Unit, functional, and system-level tests across 9 test files.
 - **Automated backups** — Daily backup to `/home/sipgw/backups/` with 30-day retention.
 
 ---
@@ -70,7 +72,7 @@ sudo bash install.sh
 
 # Configure
 sudo vi /opt/sipgw/config.yaml     # Set fusion credentials
-sudo vi /opt/sipgw/lookups.yaml    # Review area/room mappings
+sudo vi /opt/sipgw/lookups.yaml    # Review area/room mappings (hot-reloaded)
 
 # Start
 sudo systemctl start sipgw
@@ -141,29 +143,38 @@ All settings are in `config.yaml`. Full reference in [docs/SIPGW_SERVICE_MANUAL.
 
 ## Lookup Tables
 
-`lookups.yaml` maps numeric IDs to speech-ready names. Edit and restart to apply.
+`lookups.yaml` maps SIP caller data to speech-ready names. **Changes are hot-reloaded automatically** — no restart needed. Use the "Verify lookups.yaml" button on the dashboard to validate after editing.
 
 ```yaml
-# Area ID → spoken name
+# Area ID → spoken name (use "..." for TTS pauses)
 areas:
-  730: "1st Floor. E.D."
-  731: "4th Floor, I.C.U."
-  710: "3rd Floor. Cardiac Step-Down."
+  730: "1st Floor... E.D..."
+  731: "4th Floor... I.C.U..."
+  797: "2nd Floor... Heart Center..."
 default_area: "Unknown Area."
 
-# Display name keywords → call purpose
+# Display name keywords → call purpose (first match wins)
 call_purposes:
   "Blue": "Code Blue"
   "RRT": "Rapid Response Team"
   "Pink": "Code Pink"
-default_purpose: "Code"
+default_purpose: "Code Blue"
 
-# Room number → spoken name (optional overrides)
-rooms:
-  208: "Mens' Room"
-  209: "Womens' Room"
+# Room-only fallback (empty — all overrides use area_rooms below)
+rooms: {}
+
+# Area+Room combo overrides — handles duplicate room numbers across areas
+# Format: "area*room": "spoken name"
+area_rooms:
+  "797*2201": "Prepost 1"     # room 2201 in Heart Center = Prepost 1
+  "730*01196": "B 15"          # room 01196 in E.D. = B 15 (leading zeros preserved)
+  "710*3196": "Dialysis"       # room 3196 in Cardiac Step-Down = Dialysis
+  # Room 2201 in area 795 (Ortho East) has no override → "Room 2201."
+
 default_room_format: "Room {room}."
 ```
+
+**Lookup priority:** `area_rooms` combo match → `rooms` fallback → `"Room {N}."`
 
 ---
 
@@ -217,6 +228,9 @@ Web UI at `http://<host>:8080` — no authentication required.
 - **SIP Messages Log** — full inbound/outbound SIP messages with Copy button
 - **API Debug Log** — complete HTTP request/response traces with Copy button
 - **JSON API** — `GET /api/calls?limit=100`
+- **Verify lookups** — button validates `lookups.yaml` with detailed error/warning output + sample download
+- **Verify API** — `GET /api/verify-lookups` (JSON validation results)
+- **Sample lookups** — `GET /api/sample-lookups` (downloadable annotated YAML)
 - **Health check** — `GET /health`
 
 ---
@@ -276,7 +290,7 @@ RTP silence: 12-byte header + 160 bytes of `0xFF` (u-law silence), 20ms interval
 
 ## Testing
 
-112 tests across 9 files:
+120 tests across 9 files:
 
 ```bash
 /opt/sipgw/venv/bin/python -m pytest tests/ -v
@@ -285,8 +299,8 @@ RTP silence: 12-byte header + 160 bytes of `0xFF` (u-law silence), 20ms interval
 | Test File | Count | Coverage |
 |-----------|-------|----------|
 | `test_parser.py` | 13 | SIP username parsing, From header extraction, leading zeros |
-| `test_lookups.py` | 14 | Area, purpose, and room lookups, leading zeros |
-| `test_tts_builder.py` | 17 | TTS building, room mapping, assembly, leading zeros |
+| `test_lookups.py` | 20 | Area, purpose, room, area+room combo lookups, leading zeros |
+| `test_tts_builder.py` | 19 | TTS building, area+room combos, assembly, leading zeros |
 | `test_sip_message.py` | 10 | SIP message parsing and response building |
 | `test_rtp.py` | 10 | RTP packet construction |
 | `test_webhook.py` | 4 | OAuth2 token handling and scenario triggering |
@@ -359,7 +373,7 @@ Includes all code, config, database, logs, and systemd unit. 30-day retention. S
 │   ├── dashboard.py         # FastAPI web dashboard (Jinja2, autoescape)
 │   ├── config.py            # Typed dataclass config loader
 │   └── logging_config.py    # Logging setup (rotation, compression, debug logs)
-├── tests/                   # 112 tests across 9 files
+├── tests/                   # 120 tests across 9 files
 └── docs/
     └── SIPGW_SERVICE_MANUAL.md  # Comprehensive service manual
 ```

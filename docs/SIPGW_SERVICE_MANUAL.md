@@ -2,8 +2,8 @@
 
 ## SIP-to-Webhook Gateway for Rauland Nurse Call Systems
 
-**Version:** 1.1
-**Last Updated:** 2026-02-19
+**Version:** 1.5
+**Last Updated:** 2026-03-24
 
 ---
 
@@ -493,46 +493,48 @@ database:
 
 Lookup tables are loaded from `lookups.yaml`. The default path is `/opt/sipgw/lookups.yaml`, which can be overridden by setting the `SIPGW_LOOKUPS` environment variable.
 
+**Changes to `lookups.yaml` are hot-reloaded automatically.** The file's modification time is checked on every lookup call. When a change is detected, the file is reloaded and a log entry is written. If the reload fails (e.g., malformed YAML), the previous data is preserved and the error is logged with a full traceback.
+
 ### 6.1 Complete lookups.yaml Structure
 
 ```yaml
 areas:
-  710: "3rd Floor. Cardiac Step-Down."
-  730: "1st Floor. E.D."
-  731: "4th Floor, I.C.U."
-  # ... (up to 34 total area mappings)
+  710: "3rd Floor... Cardiac Step-Down..."
+  730: "1st Floor... E.D..."
+  731: "4th Floor... I.C.U..."
+  797: "2nd Floor... Heart Center..."
 default_area: "Unknown Area."
 
 call_purposes:
   "Blue": "Code Blue"
   "RRT": "Rapid Response Team"
   "Pink": "Code Pink"
-default_purpose: "Code"
+default_purpose: "Code Blue"
 
-rooms:
-  208: "Mens' Room"
-  209: "Womens' Room"
-  # ... add room mappings as needed
+rooms: {}
+
+area_rooms:
+  "797*2201": "Prepost 1"
+  "730*01196": "B 15"
+  "710*3196": "Dialysis"
 default_room_format: "Room {room}."
 ```
 
 ### 6.2 Areas Table
 
-The `areas` table maps numeric area IDs (integers) to human-readable area descriptions (strings). Area IDs are extracted from the SIP username (the digits following `a` in the pattern `a{area}r{room}`).
-
-Each area description typically includes the floor and department/unit name, punctuated with periods for clear TTS pronunciation. For example:
+The `areas` table maps area IDs to human-readable area descriptions. Area IDs are extracted from the SIP username (the digits following `a` in the pattern `a{area}r{room}`). Use `"..."` (ellipsis) to create natural TTS pauses.
 
 | Area ID | Description |
 |---------|-------------|
-| 710 | `"3rd Floor. Cardiac Step-Down."` |
-| 730 | `"1st Floor. E.D."` |
-| 731 | `"4th Floor, I.C.U."` |
+| 710 | `"3rd Floor... Cardiac Step-Down..."` |
+| 730 | `"1st Floor... E.D..."` |
+| 797 | `"2nd Floor... Heart Center..."` |
 
 If an area ID is not found in the table, the `default_area` value is used (default: `"Unknown Area."`).
 
 ### 6.3 Call Purposes Table
 
-The `call_purposes` table maps keyword strings to full alert type labels. The keyword search is performed against the SIP From header display name. The search checks whether the display name contains the keyword as a substring.
+The `call_purposes` table maps keyword strings to full alert type labels. The keyword search is performed against the SIP From header display name as a substring match. First match wins, so order matters.
 
 | Keyword | Alert Label |
 |---------|-------------|
@@ -540,28 +542,54 @@ The `call_purposes` table maps keyword strings to full alert type labels. The ke
 | `"RRT"` | `"Rapid Response Team"` |
 | `"Pink"` | `"Code Pink"` |
 
-If no keyword is found in the display name, the `default_purpose` value is used (default: `"Code"`).
+If no keyword is found in the display name, the `default_purpose` value is used.
 
-### 6.4 Rooms Table
+### 6.4 Area+Room Combo Overrides (Primary Room Naming)
 
-The `rooms` table maps specific room numbers (integers) to custom room name strings. This allows overriding the default room format for rooms that have special names.
+The `area_rooms` table is the primary mechanism for naming rooms. It maps `"area*room"` combinations to spoken room names, handling duplicate room numbers across areas.
 
-| Room Number | Custom Name |
-|-------------|-------------|
-| 208 | `"Mens' Room"` |
-| 209 | `"Womens' Room"` |
+**Format:** `"area*room": "spoken name"`
 
-If a room number is not found in the table, the `default_room_format` template is used, with `{room}` replaced by the actual room number. For example, room 201 would produce `"Room 201."`.
+| Key | Spoken Name | Explanation |
+|-----|-------------|-------------|
+| `"797*2201"` | `"Prepost 1"` | Room 2201 in Heart Center (area 797) |
+| `"795*2201"` | *(no entry)* | Room 2201 in Ortho East → falls to default `"Room 2201."` |
+| `"730*01196"` | `"B 15"` | Room 01196 in E.D. (leading zeros preserved) |
+| `"710*3196"` | `"Dialysis"` | Room 3196 in Cardiac Step-Down |
 
-### 6.5 Adding New Entries
+**Lookup priority:**
+1. `area_rooms` combo match (e.g., `"797*2201"` → `"Prepost 1."`)
+2. `rooms` fallback (if any entries exist in the `rooms:` section)
+3. `default_room_format` (e.g., `"Room 2201."`)
 
-To add new lookup entries:
+### 6.5 Rooms Table (Fallback)
 
-1. Edit `/opt/sipgw/lookups.yaml`.
-2. Add the new entry under the appropriate section (`areas`, `call_purposes`, or `rooms`).
-3. Restart the service: `sudo systemctl restart sipgw`.
+The `rooms` table provides a global fallback for room names that apply regardless of area. Currently empty (`rooms: {}`) since all overrides use `area_rooms` combos. Can be populated if universal room names are needed.
 
-The lookup tables are loaded once at process startup and cached in memory, so a restart is required for changes to take effect.
+### 6.6 Editing Lookups
+
+To add or modify lookup entries:
+
+1. Edit `/opt/sipgw/lookups.yaml` with any text editor.
+2. Save the file — **changes are detected and applied automatically** on the next call. No restart needed.
+3. Use the **"Verify lookups.yaml"** button on the dashboard (`:8080`) to validate your changes.
+
+The verify button checks:
+- YAML syntax validity
+- Required sections present (`areas`, `call_purposes`, `area_rooms`)
+- All values are correct types (strings, not lists or numbers)
+- `area_rooms` keys have proper `"area*room"` format
+- Area IDs in `area_rooms` cross-referenced against the `areas` section
+- `default_room_format` contains the `{room}` placeholder
+
+If validation fails, detailed per-entry error messages are shown. A **"Download sample lookups.yaml"** link provides an annotated reference file.
+
+### 6.7 API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/verify-lookups` | GET | Returns JSON with `valid`, `errors`, `warnings`, `summary` |
+| `/api/sample-lookups` | GET | Downloads annotated `lookups-sample.yaml` file |
 
 ---
 
@@ -586,19 +614,24 @@ The function `get_call_purpose(display_name)` searches the `call_purposes` looku
 
 The function `get_area_name(area_number)` looks up the area ID in the `areas` table:
 
-- Input: `730` (the area number parsed from the SIP username `a730r201`)
-- Lookup: `areas[730]` returns `"1st Floor. E.D."`
+- Input: `"730"` (the area number parsed from the SIP username `a730r201`)
+- Lookup: `areas["730"]` returns `"1st Floor... E.D..."`
 - If the area ID were not in the table, the result would be the `default_area` value: `"Unknown Area."`
 
 #### Step 3: Determine Room Name
 
-The function `get_room_name(room_number)` looks up the room number in the `rooms` table:
+The function `get_room_name(room_number, area_number)` resolves the room name using a three-tier lookup:
 
-- Input: `201` (the room number parsed from the SIP username `a730r201`)
-- Lookup: `rooms[201]` is not present in the table.
-- Since no mapping exists, the `default_room_format` template is used: `"Room {room}."` with `{room}` replaced by `201`, yielding `"Room 201."`.
+1. **Area+Room combo** (`area_rooms`): checks `"730*01196"` → `"B 15."` if present
+2. **Room-only fallback** (`rooms`): checks `rooms["201"]` — currently empty
+3. **Default format**: `"Room {room}."` → `"Room 201."`
 
-**Room mapping example:** If the room number were `208`, the lookup would find `rooms[208] = "Mens' Room"`, and the result would be `"Mens' Room."` instead of `"Room 208."`. This allows special rooms (restrooms, lobbies, waiting areas) to be announced by their descriptive name rather than their number.
+**Combo override example:**
+- SIP username `a797*r2201*b1` → area `"797"`, room `"2201"`
+- Lookup: `area_rooms["797*2201"]` = `"Prepost 1"` → `"Prepost 1."`
+- Same room in different area: `a795*r2201*b1` → no combo match → `"Room 2201."`
+
+**Leading zeros:** Room number `"01196"` is preserved as-is from the SIP username. The combo key `"730*01196"` matches the YAML entry exactly.
 
 #### Step 4: Combine into Base String
 
@@ -608,7 +641,8 @@ The three components are combined using the format:
 {purpose}! {area_name} {room_text}
 ```
 
-Result: `"Code Blue! 1st Floor. E.D. Room 201."`
+Result: `"Code Blue! 1st Floor... E.D... Room 201."`
+Or with combo override: `"Code Blue! 2nd Floor... Heart Center... Prepost 1."`
 
 ### 7.2 Stage 2: assemble_tts() -- Preamble and Repetition
 
@@ -1223,7 +1257,7 @@ The OAuth2 token response is validated for proper JSON structure and the presenc
 
 ## 17. Testing
 
-SIPGW includes a comprehensive test suite with 105 tests across 9 test files. The tests cover unit tests for individual modules, functional tests for the integrated pipeline, and system-level tests using real UDP sockets.
+SIPGW includes a comprehensive test suite with 120 tests across 9 test files. The tests cover unit tests for individual modules, functional tests for the integrated pipeline, and system-level tests using real UDP sockets.
 
 ### 17.1 Running Tests
 

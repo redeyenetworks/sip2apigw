@@ -16,6 +16,7 @@ def load_test_lookups():
     lookups_mod._area_map = {}
     lookups_mod._purpose_map = {}
     lookups_mod._room_map = {}
+    lookups_mod._area_room_map = {}
     lookups_mod._default_area = "Unknown Area."
     lookups_mod._default_purpose = "Code"
     lookups_mod._default_room_format = "Room {room}."
@@ -159,6 +160,33 @@ class TestBuildTTS:
         )
         result = build_tts(caller)
         assert result == "Code Blue! 1st Floor. E.D. Room 01196."
+
+    def test_area_room_combo_override(self):
+        """Area+room combo override takes priority."""
+        lookups_mod._area_room_map["797*2201"] = "Prepost 1"
+        caller = CallerInfo(
+            raw_user="a797r2201b1",
+            display_name="Code Blue",
+            area_number="797",
+            room_number="2201",
+            bed_number="1",
+            parse_success=True,
+        )
+        result = build_tts(caller)
+        assert "Prepost 1." in result
+
+    def test_area_room_no_combo_uses_default(self):
+        """Same room in different area without combo uses default format."""
+        lookups_mod._area_room_map["797*2201"] = "Prepost 1"
+        caller = CallerInfo(
+            raw_user="a795r2201b1",
+            display_name="Code Blue",
+            area_number="795",
+            room_number="2201",
+            parse_success=True,
+        )
+        result = build_tts(caller)
+        assert "Room 2201." in result
 
 
 class TestAssembleTTS:

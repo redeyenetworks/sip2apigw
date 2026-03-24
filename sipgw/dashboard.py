@@ -4,10 +4,12 @@ Provides a web UI showing call history with pagination, auto-refresh toggle,
 log viewers, and health endpoint. No authentication required.
 """
 
+import os
 import logging
+import yaml
 from pathlib import Path
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from typing import Optional
 
 from .database import CallDatabase
@@ -193,6 +195,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
+    <div style="margin-bottom: 15px;">
+        <button id="verifyBtn" onclick="verifyLookups()" style="background: #16213e; color: #4fc3f7; border: 1px solid #0f3460; border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; cursor: pointer; transition: background 0.15s;">Verify lookups.yaml</button>
+        <span id="verifyStatus" style="margin-left: 10px; font-size: 0.85rem;"></span>
+    </div>
+    <div id="verifyResult" style="display: none; margin-bottom: 20px;"></div>
+
     <table>
         <thead>
             <tr>
@@ -337,9 +345,248 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     // Initialize
     startRefresh();
+
+    function verifyLookups() {
+        var btn = document.getElementById('verifyBtn');
+        var status = document.getElementById('verifyStatus');
+        var result = document.getElementById('verifyResult');
+        btn.disabled = true;
+        status.innerHTML = '<span style="color: #888;">Checking...</span>';
+        result.style.display = 'none';
+
+        fetch('/api/verify-lookups')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                btn.disabled = false;
+                if (data.valid) {
+                    status.innerHTML = '<span style="color: #4caf50;">&#10003; Valid — ' + data.summary + '</span>';
+                    result.style.display = 'none';
+                } else {
+                    status.innerHTML = '<span style="color: #f44336;">&#10007; Problems found</span>';
+                    var html = '<div style="background: #1c1017; border: 1px solid #5c1a1a; border-radius: 8px; padding: 15px; font-size: 0.82rem; color: #f8a0a0;">';
+                    html += '<strong style="color: #f44336;">Validation Errors:</strong><br><br>';
+                    for (var i = 0; i < data.errors.length; i++) {
+                        html += '<div style="margin-bottom: 8px; padding-left: 12px; border-left: 2px solid #5c1a1a;">' + escapeHtml(data.errors[i]) + '</div>';
+                    }
+                    if (data.warnings && data.warnings.length > 0) {
+                        html += '<br><strong style="color: #ff9800;">Warnings:</strong><br><br>';
+                        for (var i = 0; i < data.warnings.length; i++) {
+                            html += '<div style="margin-bottom: 8px; padding-left: 12px; border-left: 2px solid #5c3a00; color: #ffc080;">' + escapeHtml(data.warnings[i]) + '</div>';
+                        }
+                    }
+                    html += '<br><a href="/api/sample-lookups" download="lookups-sample.yaml" style="color: #4fc3f7; text-decoration: underline;">Download sample lookups.yaml</a>';
+                    html += '</div>';
+                    result.innerHTML = html;
+                    result.style.display = 'block';
+                }
+            })
+            .catch(function(err) {
+                btn.disabled = false;
+                status.innerHTML = '<span style="color: #f44336;">Error: ' + err + '</span>';
+            });
+    }
+
+    function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s;
+        return d.innerHTML;
+    }
     </script>
 </body>
 </html>"""
+
+
+SAMPLE_LOOKUPS_YAML = """\
+# =============================================================================
+# sipgw lookups.yaml — Lookup Tables for TTS Announcements
+# =============================================================================
+#
+# This file defines how SIP caller information is translated into
+# spoken text-to-speech (TTS) announcements. Edit this file and save —
+# changes are picked up automatically without restarting the service.
+#
+# There are three types of mappings:
+#
+#   1. AREAS        — Maps area IDs to spoken area names
+#   2. CALL PURPOSES — Maps display name keywords to spoken alert types
+#   3. AREA+ROOM    — Maps area+room combos to spoken room names
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# AREAS — Map area ID (from SIP username) to a spoken area name.
+#
+# The area ID comes from the SIP caller username format: a{area}r{room}b{bed}
+# For example, in "a730r201b1", the area ID is "730".
+#
+# Use "..." (ellipsis) to create natural TTS pauses between phrases.
+# The area name is spoken AFTER the alert type: "Code Blue! [area name] [room]"
+# -----------------------------------------------------------------------------
+areas:
+  710: "3rd Floor... Cardiac Step-Down..."
+  711: "2nd Floor... Orthopedics..."
+  730: "1st Floor... E.D..."
+  731: "4th Floor... I.C.U..."
+  # Add more areas as needed. The key is the numeric area ID.
+
+# Default spoken when the area ID is not found in the table above.
+default_area: "Unknown Area."
+
+# -----------------------------------------------------------------------------
+# CALL PURPOSES — Map keywords found in the SIP display name to a spoken
+# alert type. The display name is searched for each keyword (substring match).
+# First match wins, so order matters.
+#
+# Example: If the SIP display name is "Code Blue Alert", the keyword "Blue"
+# matches, and the spoken purpose becomes "Code Blue".
+# -----------------------------------------------------------------------------
+call_purposes:
+  "Blue": "Code Blue"
+  "RRT": "Rapid Response Team"
+  "Pink": "Code Pink"
+  # Add more as needed. Key = keyword to search for, Value = spoken text.
+
+# Default spoken when no keyword matches (or display name is empty).
+default_purpose: "Code"
+
+# -----------------------------------------------------------------------------
+# ROOMS (fallback) — Map room numbers to spoken room names.
+# These apply globally regardless of area. Use area_rooms below for
+# area-specific overrides. Leave empty if all room names are area-specific.
+# -----------------------------------------------------------------------------
+rooms: {}
+
+# -----------------------------------------------------------------------------
+# AREA+ROOM COMBO OVERRIDES — Map area+room combinations to spoken room names.
+#
+# This is the PRIMARY room naming mechanism. Use this when the same room
+# number exists in different areas with different meanings.
+#
+# Format: "area*room": "spoken name"
+#   - area = the area ID from the SIP username
+#   - room = the room number from the SIP username (leading zeros preserved)
+#   - The spoken name will have a period appended automatically.
+#
+# Lookup priority:
+#   1. area_rooms match  (e.g., "797*2201" -> "Prepost 1.")
+#   2. rooms match       (fallback, if rooms section has entries)
+#   3. default format    (e.g., "Room 2201.")
+#
+# EXAMPLES:
+#   Room 2201 in area 797 (Heart Center) = "Prepost 1"
+#   Room 2201 in area 795 (Ortho East)   = no override -> "Room 2201."
+#   Room 01196 in area 730 (E.D.)        = "B 15" (leading zeros preserved)
+# -----------------------------------------------------------------------------
+area_rooms:
+  "797*2201": "Prepost 1"
+  "797*2202": "Prepost 2"
+  "730*01196": "B 15"
+  "710*3196": "Dialysis"
+  # Add more as needed.
+
+# Default format when room is not found in any lookup.
+# {room} is replaced with the actual room number (leading zeros preserved).
+default_room_format: "Room {room}."
+"""
+
+
+def _validate_lookups(lookups_path: str) -> dict:
+    """Validate the lookups.yaml file and return detailed results."""
+    errors = []
+    warnings = []
+
+    # Check file exists
+    if not os.path.exists(lookups_path):
+        return {"valid": False, "errors": [f"File not found: {lookups_path}"], "warnings": [], "summary": ""}
+
+    # Check readable
+    try:
+        with open(lookups_path, "r") as f:
+            raw_text = f.read()
+    except Exception as e:
+        return {"valid": False, "errors": [f"Cannot read file: {e}"], "warnings": [], "summary": ""}
+
+    # Check YAML parseable
+    try:
+        data = yaml.safe_load(raw_text)
+    except yaml.YAMLError as e:
+        return {"valid": False, "errors": [f"YAML parse error: {e}"], "warnings": [], "summary": ""}
+
+    if not isinstance(data, dict):
+        return {"valid": False, "errors": ["File must contain a YAML mapping (key: value pairs), got: " + type(data).__name__], "warnings": [], "summary": ""}
+
+    # Check required sections
+    for section in ["areas", "call_purposes", "area_rooms"]:
+        if section not in data:
+            errors.append(f"Missing required section: '{section}'")
+        elif not isinstance(data[section], dict):
+            errors.append(f"Section '{section}' must be a mapping (key: value), got: {type(data[section]).__name__}")
+
+    # Validate areas
+    areas = data.get("areas", {})
+    if isinstance(areas, dict):
+        for k, v in areas.items():
+            if not isinstance(v, str):
+                errors.append(f"areas[{k}]: value must be a string, got {type(v).__name__}: {v!r}")
+            elif not v.strip():
+                warnings.append(f"areas[{k}]: value is empty")
+
+    # Validate call_purposes
+    purposes = data.get("call_purposes", {})
+    if isinstance(purposes, dict):
+        for k, v in purposes.items():
+            if not isinstance(k, str):
+                errors.append(f"call_purposes: key must be a string, got {type(k).__name__}: {k!r}")
+            if not isinstance(v, str):
+                errors.append(f"call_purposes[{k}]: value must be a string, got {type(v).__name__}: {v!r}")
+
+    # Validate rooms (if present)
+    rooms = data.get("rooms", {})
+    if rooms and isinstance(rooms, dict):
+        for k, v in rooms.items():
+            if not isinstance(v, str):
+                errors.append(f"rooms[{k}]: value must be a string, got {type(v).__name__}: {v!r}")
+
+    # Validate area_rooms
+    area_rooms = data.get("area_rooms", {})
+    if isinstance(area_rooms, dict):
+        area_ids = {str(k) for k in areas} if isinstance(areas, dict) else set()
+        for k, v in area_rooms.items():
+            k_str = str(k)
+            if "*" not in k_str:
+                errors.append(f"area_rooms[{k}]: key must be in 'area*room' format (missing '*')")
+            else:
+                parts = k_str.split("*")
+                if len(parts) != 2:
+                    errors.append(f"area_rooms[{k}]: key must have exactly one '*' separator, got {len(parts)-1}")
+                elif not parts[0] or not parts[1]:
+                    errors.append(f"area_rooms[{k}]: area and room parts cannot be empty")
+                elif area_ids and parts[0] not in area_ids:
+                    warnings.append(f"area_rooms[{k}]: area '{parts[0]}' not found in areas section")
+            if not isinstance(v, str):
+                errors.append(f"area_rooms[{k}]: value must be a string, got {type(v).__name__}: {v!r}")
+            elif not v.strip():
+                warnings.append(f"area_rooms[{k}]: value is empty")
+
+    # Validate default_room_format
+    fmt = data.get("default_room_format", "")
+    if fmt and "{room}" not in fmt:
+        warnings.append(f"default_room_format: missing {{room}} placeholder: {fmt!r}")
+
+    # Summary
+    area_count = len(areas) if isinstance(areas, dict) else 0
+    purpose_count = len(purposes) if isinstance(purposes, dict) else 0
+    room_count = len(rooms) if isinstance(rooms, dict) else 0
+    ar_count = len(area_rooms) if isinstance(area_rooms, dict) else 0
+
+    summary = f"{area_count} areas, {purpose_count} purposes, {room_count} rooms, {ar_count} area+room overrides"
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "summary": summary,
+    }
 
 
 def _read_log_tail(log_path: str, num_lines: int = 50) -> list[str]:
@@ -426,6 +673,23 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         """JSON API for recent calls."""
         calls = await db.get_recent_calls(limit=limit)
         return {"calls": calls}
+
+    lookups_file = os.environ.get("SIPGW_LOOKUPS", "/opt/sipgw/lookups.yaml")
+
+    @app.get("/api/verify-lookups")
+    async def verify_lookups():
+        """Validate the lookups.yaml file and return detailed results."""
+        result = _validate_lookups(lookups_file)
+        return JSONResponse(content=result)
+
+    @app.get("/api/sample-lookups")
+    async def sample_lookups():
+        """Download a sample lookups.yaml with detailed commentary."""
+        return PlainTextResponse(
+            content=SAMPLE_LOOKUPS_YAML,
+            media_type="application/x-yaml",
+            headers={"Content-Disposition": "attachment; filename=lookups-sample.yaml"},
+        )
 
     @app.get("/health")
     async def health():

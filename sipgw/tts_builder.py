@@ -29,7 +29,7 @@ def build_tts(caller: CallerInfo) -> str:
     """
     purpose = get_call_purpose(caller.display_name)
     area_name = get_area_name(caller.area_number) if caller.area_number is not None else "Unknown Area."
-    room_text = get_room_name(caller.room_number) if caller.room_number is not None else "Room Unknown."
+    room_text = get_room_name(caller.room_number, caller.area_number) if caller.room_number is not None else "Room Unknown."
 
     tts = f"{purpose}! {area_name} {room_text}"
 

@@ -4,6 +4,23 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.5] — 2026-03-24
+
+### Added
+- **Area+Room combo overrides** (`area_rooms:` in lookups.yaml) — maps `"area*room"` keys to spoken room names, handling duplicate room numbers across areas. 211 authoritative overrides. Lookup priority: area_rooms combo → rooms fallback → default format.
+- **Hot-reload of lookups.yaml** — file changes detected automatically via mtime check on every lookup call. No service restart needed. Failed reloads logged with full traceback; previous data preserved.
+- **Verify lookups.yaml button** on dashboard — validates YAML syntax, required sections, key formats, value types, and cross-references. Shows detailed per-entry error messages and warnings.
+- **Sample lookups download** (`/api/sample-lookups`) — downloadable `lookups-sample.yaml` with extensive commentary documenting all mapping types.
+- `/api/verify-lookups` JSON endpoint for programmatic validation.
+- 120 tests across 9 test files.
+
+### Changed
+- Room naming now uses `get_room_name(room, area)` — area parameter enables combo lookups.
+- Removed all 305 room-only entries from `lookups.yaml` — all overrides now use `area_rooms` combos.
+- `tts_builder.py` passes `area_number` to `get_room_name()` for combo lookup support.
+
+---
+
 ## [v1.4] — 2026-03-24
 
 ### Fixed
