@@ -298,14 +298,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <script>
     function copyLog(btn) {
         var pre = btn.parentElement.querySelector('pre');
-        navigator.clipboard.writeText(pre.textContent).then(function() {
-            btn.textContent = 'Copied!';
-            btn.classList.add('copied');
-            setTimeout(function() {
-                btn.textContent = 'Copy';
-                btn.classList.remove('copied');
-            }, 2000);
-        });
+        var text = pre.textContent;
+        // Try modern clipboard API first, fall back to execCommand for HTTP
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(function() { showCopied(btn); });
+        } else {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            showCopied(btn);
+        }
+    }
+    function showCopied(btn) {
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(function() {
+            btn.textContent = 'Copy';
+            btn.classList.remove('copied');
+        }, 2000);
     }
 
     // Auto-refresh logic
@@ -636,14 +651,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             page=page, page_size=page_size, today_only=True,
         )
 
-        success = sum(
-            1 for c in calls
-            if c.get("fusion_status") and 200 <= c["fusion_status"] < 300
-        )
-        failed = sum(
-            1 for c in calls
-            if c.get("fusion_status") and (c["fusion_status"] < 200 or c["fusion_status"] >= 300)
-        )
+        stats = await db.get_today_stats()
+        success = stats["success"]
+        failed = stats["failed"]
 
         log_lines = _read_log_tail(log_file)
         api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None

@@ -43,6 +43,7 @@ def mock_db():
     db = AsyncMock(spec=CallDatabase)
     db.get_recent_calls = AsyncMock(return_value=SAMPLE_CALLS)
     db.get_calls_page = AsyncMock(return_value=(SAMPLE_CALLS, 2, 1))
+    db.get_today_stats = AsyncMock(return_value={"success": 50, "failed": 3})
     return db
 
 
@@ -98,8 +99,20 @@ class TestDashboard:
         data = response.json()
         assert data["status"] == "ok"
 
+    def test_stats_from_db_not_page(self, mock_db, dashboard_config):
+        """Stats cards should reflect all today's calls, not just the current page."""
+        mock_db.get_calls_page = AsyncMock(return_value=(SAMPLE_CALLS, 100, 5))
+        mock_db.get_today_stats = AsyncMock(return_value={"success": 85, "failed": 15})
+        app = create_dashboard(mock_db, dashboard_config)
+        client = TestClient(app)
+        response = client.get("/")
+        # Should show DB-wide stats (85/15), not page-level (2/0)
+        assert ">85<" in response.text
+        assert ">15<" in response.text
+
     def test_empty_dashboard(self, mock_db, dashboard_config):
         mock_db.get_calls_page = AsyncMock(return_value=([], 0, 1))
+        mock_db.get_today_stats = AsyncMock(return_value={"success": 0, "failed": 0})
         app = create_dashboard(mock_db, dashboard_config)
         client = TestClient(app)
         response = client.get("/")

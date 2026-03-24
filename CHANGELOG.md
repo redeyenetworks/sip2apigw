@@ -4,6 +4,14 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.5.1] — 2026-03-24
+
+### Fixed
+- **Dashboard stats capped at page size** — "Successful" and "Failed" counts were computed from the current page (max 20 rows) instead of all today's calls. Now uses a dedicated SQL query (`get_today_stats()`) that counts across all of today's records.
+- **Copy buttons not working over HTTP** — `navigator.clipboard.writeText()` requires HTTPS or localhost. Added `document.execCommand('copy')` fallback for plain HTTP connections over LAN.
+
+---
+
 ## [v1.5] — 2026-03-24
 
 ### Added

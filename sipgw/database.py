@@ -133,6 +133,25 @@ class CallDatabase:
         total_pages = max(1, (total + page_size - 1) // page_size)
         return [dict(row) for row in rows], total, total_pages
 
+    async def get_today_stats(self) -> dict:
+        """Get success/failed counts for all of today's calls."""
+        import time
+        today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
+
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND fusion_status >= 200 AND fusion_status < 300",
+            (today_start,),
+        )
+        success = (await cursor.fetchone())[0]
+
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND (fusion_status < 200 OR fusion_status >= 300)",
+            (today_start,),
+        )
+        failed = (await cursor.fetchone())[0]
+
+        return {"success": success, "failed": failed}
+
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
