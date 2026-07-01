@@ -17,21 +17,24 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# --- Stop and disable service ---
-echo "[1/4] Stopping and disabling service..."
-if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    systemctl stop "$SERVICE_NAME"
-    echo "  Service stopped."
-fi
-if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-    systemctl disable "$SERVICE_NAME"
-    echo "  Service disabled."
-fi
-if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    echo "  Unit file removed."
-fi
+# --- Stop and disable services ---
+# #14 two-service split: tear down both the writer and the dashboard unit.
+echo "[1/4] Stopping and disabling services..."
+for unit in "$SERVICE_NAME" "${SERVICE_NAME}-dashboard"; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        systemctl stop "$unit"
+        echo "  Service $unit stopped."
+    fi
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        systemctl disable "$unit"
+        echo "  Service $unit disabled."
+    fi
+    if [[ -f "/etc/systemd/system/${unit}.service" ]]; then
+        rm -f "/etc/systemd/system/${unit}.service"
+        echo "  Unit file ${unit}.service removed."
+    fi
+done
+systemctl daemon-reload
 
 # --- Remove virtual environment ---
 echo "[2/4] Removing virtual environment..."

@@ -213,3 +213,72 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
         install_test_marker()
 
     root_logger.info("Logging initialized")
+
+
+def setup_dashboard_logging(config: Optional[LoggingConfig] = None,
+                            dry_run: bool = False) -> None:
+    """#14 DASHBOARD-SAFE logging for the decoupled dashboard process.
+
+    The dashboard (``python -m sipgw.dashboard_app``) runs in a SEPARATE process
+    from the writer (``python -m sipgw.main``). It MUST NOT attach the #6
+    CompressingTimedRotatingFileHandler to the writer's shared files
+    (sipgw.log / sipgw_api_debug.log / sipgw_sip_debug.log): two processes each
+    owning a rotating handler on the same file would race at midnight in
+    ``doRollover()`` and corrupt or lose logs.
+
+    So this installs a console/StreamHandler (journald captures it under
+    systemd) plus, optionally, the dashboard's OWN ``sipgw_dashboard.log``
+    rotating file — a distinct filename the writer never touches. As in
+    ``setup_logging``, the [TEST] marker is installed FIRST in dry-run so every
+    line this emits is marked.
+    """
+    if config is None:
+        config = LoggingConfig()
+
+    root_logger = logging.getLogger("sipgw")
+    root_logger.setLevel(logging.DEBUG)
+
+    if dry_run:
+        # Mark before any line is emitted (logger-level filter).
+        from .safety import install_test_marker
+        install_test_marker()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Console handler (journald captures stdout/stderr under systemd).
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    root_logger.addHandler(console)
+
+    # Optional OWN rotating file — NEVER the writer's sipgw.log. The distinct
+    # filename guarantees the two processes never share a rotating handler.
+    log_dir = Path(config.log_dir)
+    if log_dir.exists():
+        dash_log_file = log_dir / "sipgw_dashboard.log"
+        dash_handler = CompressingTimedRotatingFileHandler(
+            str(dash_log_file),
+            when="midnight",
+            interval=1,
+            backupCount=config.retention_days,
+            retention_days=config.retention_days,
+            atTime=None,
+        )
+        dash_handler.setLevel(logging.DEBUG)
+        dash_handler.setFormatter(formatter)
+        dash_handler.suffix = "%Y-%m-%d"
+        _add_async_handler(root_logger, dash_handler)   # #6 off-loop file I/O
+    else:
+        root_logger.warning(
+            f"Log directory {log_dir} does not exist; dashboard file logging disabled")
+
+    if dry_run:
+        # Second install now that the handlers exist so propagated child-logger
+        # records are marked at the handler level too.
+        from .safety import install_test_marker
+        install_test_marker()
+
+    root_logger.info("Dashboard logging initialized")

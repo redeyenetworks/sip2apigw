@@ -120,13 +120,46 @@ STATE_LEGACY = "legacy"
 class CallDatabase:
     """Async SQLite database for storing call records."""
 
-    def __init__(self, db_path: str, timezone: str = ""):
+    def __init__(self, db_path: str, timezone: str = "",
+                 read_only: bool = False, dry_run: bool = False):
         self.db_path = db_path
         self.timezone = timezone           # #12 day-boundary + display zone ("" = host)
+        # #14 two-service split: the decoupled dashboard opens READ-ONLY so it
+        # can never write the shared DB. dry_run feeds the prod-DB barrier, which
+        # runs on EVERY open (writer AND read-only reader).
+        self.read_only = read_only
+        self.dry_run = dry_run
         self._db: Optional[aiosqlite.Connection] = None
 
-    async def initialize(self) -> None:
-        """Open the connection, apply durability pragmas, create + migrate."""
+    async def initialize(self, read_only: Optional[bool] = None) -> None:
+        """Open the connection.
+
+        Writer path (default): apply durability pragmas (WAL), create + migrate.
+        Read-only path (#14, dashboard): connect, set busy_timeout + query_only,
+        and SKIP every write (no WAL pragma, no CREATE, no migrate) so the reader
+        can never mutate the shared DB. ``query_only=ON`` (not ``mode=ro``) so the
+        -shm/-wal sidecars can still build while logical writes are blocked.
+
+        The prod-DB barrier runs on EVERY open — including the read-only reader —
+        so dry-run/test can never attach to the production database.
+        """
+        if read_only is None:
+            read_only = self.read_only
+        self.read_only = read_only
+
+        # §2b prod-DB hard barrier — runs on every open, including read-only.
+        from .safety import assert_safe_database_path
+        assert_safe_database_path(self.db_path, self.dry_run)
+
+        if read_only:
+            # Reader: do NOT create the data dir and do NOT write anything.
+            self._db = await aiosqlite.connect(self.db_path)
+            self._db.row_factory = aiosqlite.Row
+            await self._db.execute("PRAGMA busy_timeout=5000")
+            await self._db.execute("PRAGMA query_only=ON")
+            logger.info(f"Database opened READ-ONLY at {self.db_path} (query_only=ON)")
+            return
+
         db_dir = Path(self.db_path).parent
         db_dir.mkdir(parents=True, exist_ok=True)
 

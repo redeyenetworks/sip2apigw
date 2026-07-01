@@ -1,0 +1,43 @@
+[Unit]
+Description=sipgw Dashboard - read-only web UI + /health for the SIP gateway
+Documentation=file:///opt/sipgw/docs/ARCHITECTURE.md
+After=network-online.target sipgw.service
+Wants=network-online.target
+# The dashboard complements the writer (sipgw.service) but is independent: it
+# opens the DB READ-ONLY and only reads the writer's heartbeat for /health.
+StartLimitIntervalSec=0
+
+[Service]
+# #14 two-service split: the dashboard is a plain long-running HTTP server
+# (no sd_notify watchdog — that stays on the life-safety writer, sipgw.service).
+Type=simple
+User=sipgw
+Group=sipgw
+WorkingDirectory=/opt/sipgw
+ExecStart=/opt/sipgw/venv/bin/python -m sipgw.dashboard_app /opt/sipgw/config.yaml
+Restart=always
+RestartSec=5
+Environment=SIPGW_CONFIG=/opt/sipgw/config.yaml
+Environment=SIPGW_LOOKUPS=/opt/sipgw/lookups.yaml
+
+# Security hardening (mirrors sipgw.service).
+NoNewPrivileges=true
+ProtectSystem=strict
+# Reads the DB + writer log files; needs to open the DB (query_only after
+# connect, so RW open) and write its own sipgw_dashboard.log.
+ReadWritePaths=/var/lib/sipgw /var/log/sipgw
+ProtectHome=true
+PrivateTmp=true
+
+# Dashboard binds an unprivileged port (default 8080) — no CAP_NET_BIND_SERVICE.
+
+# Resource limits. NOTE: MemoryMax/CPUQuota enforce ONLY under real systemd with
+# the relevant cgroup controllers; they are inert in containers/CI without them.
+# They give the dashboard its own memory/CPU envelope so a runaway UI request
+# can never starve the life-safety writer process.
+MemoryMax=256M
+CPUQuota=50%
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

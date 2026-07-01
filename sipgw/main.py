@@ -1,6 +1,9 @@
-"""Main entry point for sipgw — SIP-to-Webhook Gateway.
+"""Main entry point for sipgw — SIP-to-Webhook Gateway (writer process).
 
-Wires together all components and runs the SIP server + dashboard concurrently.
+Wires together the SIP server + delivery worker + heartbeat + watchdog. As of
+#14 (two-service split) the dashboard runs in its OWN process
+(``python -m sipgw.dashboard_app``); this process no longer serves HTTP. It
+KEEPS writing the heartbeat row, which the decoupled dashboard reads for /health.
 """
 
 import asyncio
@@ -8,7 +11,6 @@ import logging
 import signal
 import sys
 import os
-import uvicorn
 
 from .config import load_config, AppConfig
 from .lookups import load_lookups
@@ -18,7 +20,6 @@ from .webhook import FusionWebhook
 from .parser import parse_caller
 from .tts_builder import build_tts, assemble_tts
 from .sip_server import SIPServer
-from .dashboard import create_dashboard
 from .delivery import DeliveryWorker
 from .escalation import Escalator
 from .dedupe import Deduper
@@ -34,7 +35,9 @@ class SIPGateway:
     def __init__(self, config: AppConfig):
         self.config = config
         self._dry_run = effective_dry_run(config.fusion.dry_run)
-        self.db = CallDatabase(config.database.path, timezone=config.logging.timezone)
+        # dry_run feeds the prod-DB barrier, which runs on every DB open.
+        self.db = CallDatabase(config.database.path, timezone=config.logging.timezone,
+                               dry_run=self._dry_run)
         self.webhook = FusionWebhook(config.fusion)
         # #3 escalation, shares the no-send guard in dry-run.
         self.escalator = Escalator(config.escalation, dry_run=self._dry_run)
@@ -45,8 +48,8 @@ class SIPGateway:
         # record-first insert as pure telemetry. It never gates delivery.
         self.deduper = Deduper(config.dedupe)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
-        self.dashboard = create_dashboard(self.db, config.dashboard, config.logging,
-                                          config.health)
+        # #14: the dashboard now runs as a separate process (sipgw.dashboard_app);
+        # this writer process no longer serves HTTP.
         self._hb_task = None           # #7 heartbeat writer
         self.watchdog = WatchdogPinger()   # #8 systemd watchdog (inert w/o systemd)
         self._shutdown_event = asyncio.Event()
@@ -135,21 +138,9 @@ class SIPGateway:
         await self.escalator.initialize()          # #3 escalation client
         await self.webhook.start_token_refresh()   # #4 keep the token warm
 
-        # Start the SIP listener + dashboard FIRST so pages can be received.
+        # Start the SIP listener FIRST so pages can be received. The dashboard
+        # runs in its own process now (#14); it reads the heartbeat for /health.
         sip_task = asyncio.create_task(self.sip_server.start())
-
-        uvicorn_config = uvicorn.Config(
-            app=self.dashboard,
-            host=self.config.dashboard.bind_ip,
-            port=self.config.dashboard.port,
-            log_level="warning",
-            access_log=False,
-        )
-        uvicorn_server = uvicorn.Server(uvicorn_config)
-        dashboard_task = asyncio.create_task(uvicorn_server.serve())
-        logger.info(
-            f"Dashboard running on http://{self.config.dashboard.bind_ip}:{self.config.dashboard.port}"
-        )
 
         # #7 stamp an initial heartbeat before /health is consulted.
         await self.db.write_heartbeat("writer")
@@ -179,7 +170,6 @@ class SIPGateway:
             notify_stopping()             # #8 tell systemd we're stopping
             await self.watchdog.stop()
             await self.sip_server.stop()
-            uvicorn_server.should_exit = True
             await self.worker.stop()      # stop delivery loop (pending rows persist)
             if self._hb_task:
                 self._hb_task.cancel()
@@ -192,7 +182,7 @@ class SIPGateway:
             await self.db.close()
 
             # Give tasks a moment to finish
-            for task in [sip_task, dashboard_task]:
+            for task in [sip_task]:
                 task.cancel()
                 try:
                     await asyncio.wait_for(task, timeout=5)
@@ -242,7 +232,7 @@ def main():
 
     logger.info(f"Configuration loaded from {config_path or 'default path'}")
     logger.info(f"SIP bind: {config.sip.bind_ip}:{config.sip.bind_port}")
-    logger.info(f"Dashboard port: {config.dashboard.port}")
+    logger.info("Dashboard runs as a separate process (sipgw.dashboard_app)")
     logger.info(f"Fusion scenario: {config.fusion.scenario_id}")
     logger.info(f"Call timeout: {config.sip.call_timeout_seconds}s")
 
