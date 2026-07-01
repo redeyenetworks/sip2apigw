@@ -193,6 +193,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="label">Failed</div>
             <div class="value" style="color: #f44336;">{{ failed_calls }}</div>
         </div>
+        <div class="stat-card">
+            <div class="label">Pending</div>
+            <div class="value" style="color: #ff9800;">{{ pending_calls }}</div>
+        </div>
     </div>
 
     <div style="margin-bottom: 15px;">
@@ -654,6 +658,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         stats = await db.get_today_stats()
         success = stats["success"]
         failed = stats["failed"]
+        pending = stats.get("pending", 0)
 
         log_lines = _read_log_tail(log_file)
         api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
@@ -668,6 +673,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             total_calls=total_calls,
             success_calls=success,
             failed_calls=failed,
+            pending_calls=pending,
             page=page,
             total_pages=total_pages,
             auto_refresh=bool(auto),

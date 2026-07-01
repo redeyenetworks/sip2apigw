@@ -288,24 +288,28 @@ class CallDatabase:
         import time
         offset = (page - 1) * page_size
 
+        # Live dashboard shows only REAL calls (is_test=0).
         if today_only:
             today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
             count_cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM calls WHERE timestamp >= ?",
+                "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0",
                 (today_start,),
             )
             total = (await count_cursor.fetchone())[0]
 
             cursor = await self._db.execute(
-                "SELECT * FROM calls WHERE timestamp >= ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM calls WHERE timestamp >= ? AND is_test=0 "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (today_start, page_size, offset),
             )
         else:
-            count_cursor = await self._db.execute("SELECT COUNT(*) FROM calls")
+            count_cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM calls WHERE is_test=0")
             total = (await count_cursor.fetchone())[0]
 
             cursor = await self._db.execute(
-                "SELECT * FROM calls ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM calls WHERE is_test=0 "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (page_size, offset),
             )
 
@@ -314,23 +318,49 @@ class CallDatabase:
         return [dict(row) for row in rows], total, total_pages
 
     async def get_today_stats(self) -> dict:
-        """Get success/failed counts for all of today's calls."""
-        import time
+        """State-aware counts for today's REAL calls (is_test=0).
+
+        success = delivered (+ legacy rows with a 2xx fusion_status)
+        failed  = failed + expired (+ legacy rows with a non-2xx fusion_status)
+        pending = pending + delivering
+        Legacy rows predate the state machine, so they are classified by their
+        stored fusion_status for continuity across the cutover boundary.
+        """
         today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
 
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND fusion_status >= 200 AND fusion_status < 300",
+        cur = await self._db.execute(
+            "SELECT state, COUNT(*) FROM calls "
+            "WHERE timestamp >= ? AND is_test=0 GROUP BY state",
             (today_start,),
         )
-        success = (await cursor.fetchone())[0]
+        by_state = {row[0]: row[1] for row in await cur.fetchall()}
 
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND (fusion_status < 200 OR fusion_status >= 300)",
+        cur = await self._db.execute(
+            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0 "
+            "AND state='legacy' AND fusion_status >= 200 AND fusion_status < 300",
             (today_start,),
         )
-        failed = (await cursor.fetchone())[0]
+        legacy_ok = (await cur.fetchone())[0]
+        cur = await self._db.execute(
+            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0 "
+            "AND state='legacy' AND (fusion_status IS NULL OR fusion_status < 200 "
+            "OR fusion_status >= 300)",
+            (today_start,),
+        )
+        legacy_bad = (await cur.fetchone())[0]
 
-        return {"success": success, "failed": failed}
+        success = by_state.get(STATE_DELIVERED, 0) + legacy_ok
+        failed = by_state.get(STATE_FAILED, 0) + by_state.get(STATE_EXPIRED, 0) + legacy_bad
+        pending = by_state.get(STATE_PENDING, 0) + by_state.get(STATE_DELIVERING, 0)
+
+        return {
+            "success": success,
+            "failed": failed,
+            "pending": pending,
+            "delivered": by_state.get(STATE_DELIVERED, 0),
+            "expired": by_state.get(STATE_EXPIRED, 0),
+            "by_state": by_state,
+        }
 
     async def close(self) -> None:
         """Close the database connection."""
