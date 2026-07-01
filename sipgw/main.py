@@ -86,6 +86,7 @@ class SIPGateway:
         # Initialize components
         await self.db.initialize()
         await self.webhook.initialize()
+        await self.webhook.start_token_refresh()   # #4 keep the token warm
 
         # #2 durable delivery: recover crash-orphaned rows, then start the worker.
         # (When #8 watchdog lands, systemd READY=1 must be sent BEFORE recover so

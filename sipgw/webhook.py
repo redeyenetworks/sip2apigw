@@ -138,6 +138,11 @@ class FusionWebhook:
         # Delta-seconds parsed from the last response's Retry-After header (or
         # None). Read by the #2 delivery worker to schedule the next attempt.
         self.last_retry_after: Optional[float] = None
+        # #4 background token refresh.
+        self._refresh_margin: float = float(
+            getattr(config, "token_refresh_margin_seconds", 300))
+        self._refresh_task = None
+        self._refresh_running = False
 
     async def initialize(self) -> None:
         """Create the HTTP client.
@@ -163,23 +168,62 @@ class FusionWebhook:
             f"{' [DRY-RUN: no-send guard active]' if self._dry_run else ''}"
         )
 
+    async def _refresh_loop(self) -> None:
+        """Keep a fresh token cached, renewing ~refresh_margin before expiry."""
+        while self._refresh_running:
+            sleep_for = 30.0
+            try:
+                await self._get_token(min_remaining=self._refresh_margin)
+                if self._token:
+                    sleep_for = max(
+                        30.0,
+                        (self._token.expires_at - time.time()) - self._refresh_margin,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("proactive token refresh failed: %s: %s",
+                               type(e).__name__, e)
+            await asyncio.sleep(min(sleep_for, 3600.0))
+
+    async def start_token_refresh(self) -> None:
+        if self._refresh_task is not None:
+            return
+        self._refresh_running = True
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+        logger.info("background token refresh started (margin=%ss)", int(self._refresh_margin))
+
+    async def stop_token_refresh(self) -> None:
+        self._refresh_running = False
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
+
     async def close(self) -> None:
         """Close the HTTP client."""
+        await self.stop_token_refresh()
         if self._client:
             await self._client.aclose()
             self._client = None
 
-    async def _get_token(self) -> str:
-        """Get a valid OAuth2 access token, refreshing if needed."""
-        # Return cached token if still valid (with 60s buffer)
-        if self._token and self._token.expires_at > time.time() + 60:
+    async def _get_token(self, min_remaining: float = 60.0) -> str:
+        """Get a valid OAuth2 access token, refreshing if it has less than
+        ``min_remaining`` seconds left. The on-demand path uses 60s; the
+        background refresher (#4) passes the larger refresh margin so the token
+        is renewed well before any page needs it.
+        """
+        if self._token and self._token.expires_at > time.time() + min_remaining:
             api_debug.debug("Using cached token (expires in %ds)",
                             int(self._token.expires_at - time.time()))
             return self._token.access_token
 
         async with self._token_lock:
             # Re-check after acquiring lock (another coroutine may have refreshed)
-            if self._token and self._token.expires_at > time.time() + 60:
+            if self._token and self._token.expires_at > time.time() + min_remaining:
                 return self._token.access_token
 
             logger.info("Fetching new OAuth2 token")

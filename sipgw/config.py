@@ -34,6 +34,9 @@ class FusionConfig:
     scenario_field_id: str = ""
     client_id: str = ""
     client_secret: str = ""
+    # Proactively refresh the OAuth2 token this many seconds before it expires,
+    # so a page never blocks on a token round-trip (#4 background refresh).
+    token_refresh_margin_seconds: int = 300
     # When True (or when env SIPGW_DRY_RUN=1), the webhook HTTP client is built
     # with the NoSendGuardTransport so NO outbound notification can reach a real
     # host. Env can only ENABLE this, never disable it. See sipgw/safety.py.
