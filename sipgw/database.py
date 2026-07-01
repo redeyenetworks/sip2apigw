@@ -471,6 +471,26 @@ class CallDatabase:
         total_pages = max(1, (total + page_size - 1) // page_size)
         return [dict(row) for row in rows], total, total_pages
 
+    async def export_calls(self, today_only: bool = True) -> list:
+        """#13-P1: export REAL calls (is_test=0) as row dicts for CSV.
+
+        Mirrors get_calls_page's WHERE clause and ALWAYS appends 'AND is_test=0'
+        so dry-run/test rows never leak into an exported file. Returns every
+        matching row (no pagination) newest-first.
+        """
+        if today_only:
+            today_start = _day_start_epoch(self.timezone)
+            cursor = await self._db.execute(
+                "SELECT * FROM calls WHERE created_at >= ? AND is_test=0 "
+                "ORDER BY created_at DESC",
+                (today_start,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM calls WHERE is_test=0 ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def get_today_stats(self) -> dict:
         """State-aware counts for today's REAL calls (is_test=0).
 
