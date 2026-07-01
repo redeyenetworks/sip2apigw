@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from typing import Optional
 
-from .database import CallDatabase
+from .database import CallDatabase, display_local
 from .config import DashboardConfig, LoggingConfig
 
 logger = logging.getLogger("sipgw.dashboard")
@@ -208,7 +208,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <table>
         <thead>
             <tr>
-                <th>Timestamp</th>
+                <th>Time (local)</th>
                 <th>Caller ID</th>
                 <th>Display Name</th>
                 <th>Area</th>
@@ -222,7 +222,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% if calls %}
                 {% for call in calls %}
                 <tr>
-                    <td>{{ call.timestamp }}</td>
+                    <td>{{ call.display_time }}</td>
                     <td>{{ call.caller_id }}</td>
                     <td>{{ call.display_name }}</td>
                     <td>{{ call.area_name }}{% if call.area_number %} ({{ call.area_number }}){% endif %}</td>
@@ -654,6 +654,12 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         calls, total_calls, total_pages = await db.get_calls_page(
             page=page, page_size=page_size, today_only=True,
         )
+
+        # #12: stored timestamps are UTC; nurses see local wall time derived
+        # from the canonical created_at epoch (not the raw stored string).
+        tz_name = log_config.timezone if log_config else "America/New_York"
+        for c in calls:
+            c["display_time"] = display_local(c.get("created_at"), tz_name)
 
         stats = await db.get_today_stats()
         success = stats["success"]

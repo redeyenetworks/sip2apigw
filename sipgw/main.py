@@ -32,7 +32,7 @@ class SIPGateway:
     def __init__(self, config: AppConfig):
         self.config = config
         self._dry_run = effective_dry_run(config.fusion.dry_run)
-        self.db = CallDatabase(config.database.path)
+        self.db = CallDatabase(config.database.path, timezone=config.logging.timezone)
         self.webhook = FusionWebhook(config.fusion)
         # #3 escalation, shares the no-send guard in dry-run.
         self.escalator = Escalator(config.escalation, dry_run=self._dry_run)

@@ -6,12 +6,52 @@ Stores call history for the dashboard. Uses aiosqlite for async access.
 import time
 import logging
 import aiosqlite
+from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 from .config import DatabaseConfig
 
 logger = logging.getLogger("sipgw.database")
+
+
+# --- #12 canonical time helpers -------------------------------------------
+# Stored `timestamp` is canonical UTC RFC3339 millis-Z. Bucketing/ordering keys
+# off the numeric `created_at` epoch (uniform across legacy + new rows), never
+# the string — the only correct way to classify mixed old-local/new-UTC rows.
+
+def _utc_rfc3339(epoch: float) -> str:
+    dt = datetime.fromtimestamp(epoch, tz=_tz.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _resolve_tz(tzname: str):
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tzname)
+        except Exception:
+            pass
+    # Fallback: aware local timezone.
+    return datetime.now().astimezone().tzinfo
+
+
+def _day_start_epoch(tzname: str) -> float:
+    """Epoch of local wall-clock midnight today in ``tzname`` (DST-correct)."""
+    tz = _resolve_tz(tzname)
+    now = datetime.now(tz)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def display_local(epoch: float, tzname: str) -> str:
+    """Render an epoch as local wall-clock for humans (dashboard/CSV)."""
+    if epoch is None:
+        return ""
+    return datetime.fromtimestamp(epoch, _resolve_tz(tzname)).strftime("%Y-%m-%d %H:%M:%S")
 
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS calls (
@@ -62,8 +102,9 @@ STATE_LEGACY = "legacy"
 class CallDatabase:
     """Async SQLite database for storing call records."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, timezone: str = "America/New_York"):
         self.db_path = db_path
+        self.timezone = timezone           # #12 day-boundary + display zone
         self._db: Optional[aiosqlite.Connection] = None
 
     async def initialize(self) -> None:
@@ -131,7 +172,7 @@ class CallDatabase:
         durable path uses ``create_pending_call`` + the mark_* transitions.
         """
         now = time.time()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        timestamp = _utc_rfc3339(now)
         if fusion_status is not None and 200 <= fusion_status < 300:
             state = STATE_DELIVERED
             delivered_at = now
@@ -170,7 +211,7 @@ class CallDatabase:
         Fusion outage between record and send, and the retry worker picks it up.
         """
         now = time.time()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        timestamp = _utc_rfc3339(now)
         cursor = await self._db.execute(
             """INSERT INTO calls
                (timestamp, caller_id, display_name, area_number, area_name,
@@ -290,15 +331,15 @@ class CallDatabase:
 
         # Live dashboard shows only REAL calls (is_test=0).
         if today_only:
-            today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
+            today_start = _day_start_epoch(self.timezone)
             count_cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0",
+                "SELECT COUNT(*) FROM calls WHERE created_at >= ? AND is_test=0",
                 (today_start,),
             )
             total = (await count_cursor.fetchone())[0]
 
             cursor = await self._db.execute(
-                "SELECT * FROM calls WHERE timestamp >= ? AND is_test=0 "
+                "SELECT * FROM calls WHERE created_at >= ? AND is_test=0 "
                 "ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (today_start, page_size, offset),
             )
@@ -326,23 +367,23 @@ class CallDatabase:
         Legacy rows predate the state machine, so they are classified by their
         stored fusion_status for continuity across the cutover boundary.
         """
-        today_start = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
+        today_start = _day_start_epoch(self.timezone)
 
         cur = await self._db.execute(
             "SELECT state, COUNT(*) FROM calls "
-            "WHERE timestamp >= ? AND is_test=0 GROUP BY state",
+            "WHERE created_at >= ? AND is_test=0 GROUP BY state",
             (today_start,),
         )
         by_state = {row[0]: row[1] for row in await cur.fetchall()}
 
         cur = await self._db.execute(
-            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0 "
+            "SELECT COUNT(*) FROM calls WHERE created_at >= ? AND is_test=0 "
             "AND state='legacy' AND fusion_status >= 200 AND fusion_status < 300",
             (today_start,),
         )
         legacy_ok = (await cur.fetchone())[0]
         cur = await self._db.execute(
-            "SELECT COUNT(*) FROM calls WHERE timestamp >= ? AND is_test=0 "
+            "SELECT COUNT(*) FROM calls WHERE created_at >= ? AND is_test=0 "
             "AND state='legacy' AND (fusion_status IS NULL OR fusion_status < 200 "
             "OR fusion_status >= 300)",
             (today_start,),

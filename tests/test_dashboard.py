@@ -116,6 +116,11 @@ class TestDashboard:
         assert "Pending" in response.text
         assert ">7<" in response.text        # pending count from the mock
 
+    def test_local_time_column(self, client):
+        # #12: dashboard shows local wall time, not the raw stored UTC string.
+        response = client.get("/")
+        assert "Time (local)" in response.text
+
     def test_empty_dashboard(self, mock_db, dashboard_config):
         mock_db.get_calls_page = AsyncMock(return_value=([], 0, 1))
         mock_db.get_today_stats = AsyncMock(return_value={"success": 0, "failed": 0})

@@ -50,3 +50,9 @@ escalation:
   # carries the no-send guard, so this URL is blocked in testing.
   webhook_url: ""
   timeout_seconds: 10.0
+
+# --- #12 timestamps note ---------------------------------------------------
+# Stored call `timestamp` is canonical UTC RFC3339 millis-Z. The dashboard
+# displays LOCAL wall-clock (and the "today" boundary is computed) using
+# `logging.timezone` above. Bucketing keys off the numeric created_at epoch, so
+# legacy local-format rows and new UTC rows both classify correctly.
