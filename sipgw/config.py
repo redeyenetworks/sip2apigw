@@ -126,3 +126,73 @@ def load_config(path: Optional[str] = None) -> AppConfig:
                 _apply_section(target, raw[section_name])
 
     return config
+
+
+class ConfigError(Exception):
+    """Raised for a configuration that must not start the service."""
+
+
+def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
+    """Validate config at startup. Raises ConfigError on fatal problems;
+    returns a list of non-fatal warning strings.
+
+    In production (dry_run off) the Fusion credentials, scenario id, and a
+    PRESET scenario_field_id are required — so the first real Code Blue does not
+    fail auth or trigger a live field-id lookup. In dry-run these are relaxed.
+    """
+    import ipaddress
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    f = config.fusion
+
+    for name, val in (("fusion.base_url", f.base_url), ("fusion.token_url", f.token_url)):
+        if not val or not str(val).startswith(("http://", "https://")):
+            errors.append(f"{name} must be an http(s) URL (got {val!r})")
+
+    if not dry_run:
+        for name, val in (("fusion.client_id", f.client_id),
+                          ("fusion.client_secret", f.client_secret),
+                          ("fusion.audience", f.audience),
+                          ("fusion.scenario_id", f.scenario_id)):
+            if not val:
+                errors.append(f"{name} is required in production (dry_run off)")
+        if not f.scenario_field_id:
+            errors.append(
+                "fusion.scenario_field_id must be preset in production so the first "
+                "real page does not trigger a live field-id lookup")
+
+    s = config.sip
+    if not (1 <= s.bind_port <= 65535):
+        errors.append(f"sip.bind_port out of range: {s.bind_port}")
+    if s.rtp_port_range_start >= s.rtp_port_range_end:
+        errors.append(
+            f"sip.rtp_port_range_start ({s.rtp_port_range_start}) must be < "
+            f"rtp_port_range_end ({s.rtp_port_range_end})")
+    if s.call_timeout_seconds <= 0:
+        warnings.append(f"sip.call_timeout_seconds is {s.call_timeout_seconds} (<=0)")
+    if not s.allowed_networks:
+        warnings.append("sip.allowed_networks is empty — all SIP sources will be rejected")
+    for net in s.allowed_networks:
+        try:
+            ipaddress.ip_network(net, strict=False)
+        except ValueError as e:
+            errors.append(f"sip.allowed_networks entry {net!r} is not a valid CIDR: {e}")
+
+    d = config.delivery
+    if d.max_attempts < 1:
+        errors.append(f"delivery.max_attempts must be >= 1 (got {d.max_attempts})")
+    if d.poll_interval_seconds <= 0:
+        errors.append(f"delivery.poll_interval_seconds must be > 0 (got {d.poll_interval_seconds})")
+    if d.max_age_seconds <= 0:
+        warnings.append(f"delivery.max_age_seconds is {d.max_age_seconds} (<=0)")
+
+    if not (1 <= config.dashboard.port <= 65535):
+        errors.append(f"dashboard.port out of range: {config.dashboard.port}")
+    if not config.database.path:
+        errors.append("database.path is required")
+
+    if errors:
+        raise ConfigError(
+            "Invalid configuration:\n  - " + "\n  - ".join(errors))
+    return warnings

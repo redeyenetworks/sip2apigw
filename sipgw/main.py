@@ -163,6 +163,16 @@ def main():
     # Refuse to start if dry-run/test mode would write to the production DB.
     assert_safe_database_path(config.database.path, dry_run)
 
+    # #9 Validate configuration; refuse to start on fatal problems so a
+    # misconfigured prod cannot silently fail on the first Code Blue.
+    from .config import validate_config, ConfigError
+    try:
+        for w in validate_config(config, dry_run):
+            logger.warning("config: %s", w)
+    except ConfigError as e:
+        logger.critical(str(e))
+        raise SystemExit(2)
+
     # Load lookup tables
     lookups_path = os.environ.get("SIPGW_LOOKUPS", "/opt/sipgw/lookups.yaml")
     load_lookups(lookups_path)
