@@ -737,6 +737,14 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         rows = await db.export_calls(today_only=True)
         tz_name = log_config.timezone if log_config else ""   # "" = host local
 
+        def _safe(v):
+            # Guard against CSV/formula injection when opened in a spreadsheet:
+            # neutralize a leading = + - @ (and control chars) on text cells.
+            s = "" if v is None else str(v)
+            if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+                s = "'" + s
+            return s
+
         def generate():
             buf = io.StringIO()
             writer = csv.writer(buf)
@@ -754,11 +762,11 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                 room = r.get("room_number")
                 writer.writerow([
                     display_local(r.get("created_at"), tz_name),
-                    r.get("caller_id") or "",
-                    area,
-                    room if room is not None else "",
-                    r.get("tts_string") or "",
-                    r.get("state") or "",
+                    _safe(r.get("caller_id")),
+                    _safe(area),
+                    _safe(room if room is not None else ""),
+                    _safe(r.get("tts_string")),
+                    _safe(r.get("state")),
                     r.get("fusion_status") if r.get("fusion_status") is not None else "",
                 ])
                 yield buf.getvalue()

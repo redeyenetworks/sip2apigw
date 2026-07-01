@@ -152,7 +152,15 @@ class CallDatabase:
         assert_safe_database_path(self.db_path, self.dry_run)
 
         if read_only:
-            # Reader: do NOT create the data dir and do NOT write anything.
+            # Reader: do NOT create the data dir and do NOT write anything. If the
+            # writer hasn't created the DB yet (dashboard raced ahead of the main
+            # service at boot), fail fast rather than let aiosqlite.connect() create
+            # an empty schema-less file at the prod path — systemd restarts us until
+            # the writer is up.
+            if not Path(self.db_path).exists():
+                raise FileNotFoundError(
+                    f"database {self.db_path} does not exist yet; the writer "
+                    f"(sipgw.service) must create it first")
             self._db = await aiosqlite.connect(self.db_path)
             self._db.row_factory = aiosqlite.Row
             await self._db.execute("PRAGMA busy_timeout=5000")
@@ -374,6 +382,11 @@ class CallDatabase:
         """
         from .parser import parse_caller_username
         from .lookups import get_call_purpose
+
+        # A page with no parseable area/room has no clinical identity to dedupe on;
+        # matching NULL IS NULL would falsely group every malformed page together.
+        if area_number is None or room_number is None:
+            return None
 
         sql = ("SELECT id, caller_id, display_name FROM calls "
                "WHERE area_number IS ? AND room_number IS ? AND is_test=? "
