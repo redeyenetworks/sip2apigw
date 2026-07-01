@@ -24,6 +24,7 @@ from .sip_message import (
     build_response,
     parse_sdp_connection,
     parse_sdp_media_port,
+    invite_fingerprint,
 )
 from .rtp_handler import RTPSilenceStream
 from .config import AppConfig
@@ -52,6 +53,7 @@ class ActiveCall:
     timeout_task: Optional[asyncio.Task] = None
     transport: object = None
     protocol_type: str = "udp"
+    fingerprint: str = ""          # #15 INVITE transaction fingerprint
     created_at: float = field(default_factory=time.time)
 
 
@@ -308,6 +310,14 @@ class SIPServer:
         """Handle an incoming INVITE — answer the call immediately."""
         call_id = msg.get_call_id()
 
+        # #15 correlation fingerprint (retransmit-stable). Computed before the
+        # re-INVITE early-return so retransmits still get a correlation line,
+        # but on_call is NOT re-invoked (no second page).
+        fingerprint = invite_fingerprint(msg)
+        logger.info(f"INVITE {call_id} fingerprint={fingerprint} from {addr[0]}:{addr[1]}")
+        sip_debug.info("INVITE fingerprint=%s call_id=%s from=%s:%s",
+                       fingerprint, call_id, addr[0], addr[1])
+
         if call_id in self.calls:
             # Re-INVITE on existing call — just re-send 200 OK
             call = self.calls[call_id]
@@ -363,6 +373,7 @@ class SIPServer:
                 caller_display_name=caller_display,
                 transport=transport,
                 protocol_type=protocol_type,
+                fingerprint=fingerprint,
             )
 
             self.calls[call_id] = call

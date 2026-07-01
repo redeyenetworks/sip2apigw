@@ -5,11 +5,16 @@ Only implements the subset of SIP needed for INVITE/ACK/BYE/CANCEL handling.
 """
 
 import re
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("sipgw.sip_message")
+
+# #15 INVITE fingerprint. Bump the version if the field set below changes so
+# older log lines remain unambiguous.
+_FINGERPRINT_VERSION = "v1"
 
 
 @dataclass
@@ -57,6 +62,47 @@ class SIPMessage:
 
     def get_to(self) -> str:
         return self.get_header("To") or self.get_header("t") or ""
+
+
+def invite_fingerprint(msg: "SIPMessage") -> str:
+    """Stable, transaction-scoped fingerprint of an INVITE for correlation.
+
+    Keyed on Call-ID + From user-part + From tag + CSeq. A UDP retransmission of
+    the same INVITE is byte-identical and yields the SAME fingerprint; a
+    genuinely new call yields a different one. Via/branch and Contact are
+    deliberately excluded so hop-by-hop routing changes don't perturb it. Values
+    are stripped but NOT lowercased (Call-ID and the URI user-part are
+    case-sensitive per RFC 3261). Never raises — missing fields still yield a
+    stable ``v1:<16-hex>`` string.
+
+    This is the TRANSACTION identity. It is intentionally distinct from #5's
+    future CLINICAL identity (area/room/bed/purpose); do not unify them.
+    """
+    try:
+        call_id = (msg.get_call_id() or "").strip()
+    except Exception:
+        call_id = ""
+    try:
+        from_hdr = msg.get_from() or ""
+    except Exception:
+        from_hdr = ""
+    m = re.search(r"sip:([^@>;\s]+)", from_hdr)
+    from_user = (m.group(1).strip() if m else "")
+    t = re.search(r";tag=([^;>\s]+)", from_hdr)
+    from_tag = (t.group(1).strip() if t else "")
+    try:
+        cseq = (msg.get_cseq() or "").strip()
+    except Exception:
+        cseq = ""
+
+    canonical = "\n".join([
+        f"call_id={call_id}",
+        f"from_user={from_user}",
+        f"from_tag={from_tag}",
+        f"cseq={cseq}",
+    ])
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"{_FINGERPRINT_VERSION}:{digest}"
 
 
 def parse_sip_message(data: bytes) -> SIPMessage:
