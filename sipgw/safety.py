@@ -160,7 +160,12 @@ class TestMarkerFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not getattr(record, "_sipgw_test_marked", False):
-            record.msg = f"{self.PREFIX}{record.msg}"
+            # Render msg % args, then prefix EVERY physical line so multi-line
+            # records (SIP dumps, API traces) have no unmarked continuation
+            # lines. Clearing args prevents a second % formatting pass.
+            text = record.getMessage()
+            record.msg = "\n".join(self.PREFIX + line for line in text.split("\n"))
+            record.args = ()
             record._sipgw_test_marked = True
         return True
 

@@ -19,6 +19,8 @@ from .parser import parse_caller
 from .tts_builder import build_tts, assemble_tts
 from .sip_server import SIPServer
 from .dashboard import create_dashboard
+from .delivery import DeliveryWorker
+from .safety import effective_dry_run
 
 logger = logging.getLogger("sipgw.main")
 
@@ -28,8 +30,12 @@ class SIPGateway:
 
     def __init__(self, config: AppConfig):
         self.config = config
+        self._dry_run = effective_dry_run(config.fusion.dry_run)
         self.db = CallDatabase(config.database.path)
         self.webhook = FusionWebhook(config.fusion)
+        # #2 durable delivery. Escalation (#3) is wired in later as on_escalate.
+        self.worker = DeliveryWorker(self.db, self.webhook, config.delivery,
+                                     on_escalate=None)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
         self.dashboard = create_dashboard(self.db, config.dashboard, config.logging)
         self._shutdown_event = asyncio.Event()
@@ -43,15 +49,13 @@ class SIPGateway:
     ):
         """Callback invoked when a SIP call is answered.
 
-        Parses caller info, builds TTS string, triggers webhook, records to DB.
+        Record-first: parse the caller, build the TTS, and persist the page as a
+        PENDING row. The delivery worker sends it (with retries) asynchronously.
+        This is what makes a Code Blue durable across a Fusion outage or a crash
+        between answering the call and delivering the page.
         """
-        # Parse caller info
         caller = parse_caller(from_header)
-
-        # Build TTS string
         tts = build_tts(caller)
-
-        # Assemble with preambles and repetition
         tts = assemble_tts(
             tts,
             play_count=self.config.tts.play_count,
@@ -59,36 +63,37 @@ class SIPGateway:
             iteration_preamble=self.config.tts.iteration_preamble,
         )
 
-        # Trigger Fusion webhook
-        status_code, response_time = await self.webhook.trigger_scenario(tts)
-
-        # Record to database
         area_name = ""
         if caller.area_number is not None:
             from .lookups import get_area_name
             area_name = get_area_name(caller.area_number)
 
-        await self.db.record_call(
+        row_id = await self.db.create_pending_call(
             caller_id=caller.raw_user,
             display_name=caller.display_name,
             area_number=caller.area_number,
             area_name=area_name,
             room_number=caller.room_number,
             tts_string=tts,
-            fusion_status=status_code,
-            response_time_ms=response_time,
+            sip_call_id=call_id,
+            is_test=1 if self._dry_run else 0,
         )
 
-        logger.info(
-            f"Call {call_id} processed: tts='{tts}' "
-            f"fusion_status={status_code} response_time={response_time:.1f}ms"
-        )
+        logger.info(f"Call {call_id} recorded PENDING (row {row_id}): tts='{tts}'")
 
     async def run(self):
         """Start all services and run until shutdown."""
         # Initialize components
         await self.db.initialize()
         await self.webhook.initialize()
+
+        # #2 durable delivery: recover crash-orphaned rows, then start the worker.
+        # (When #8 watchdog lands, systemd READY=1 must be sent BEFORE recover so
+        # a large recovery cannot trip the watchdog into a restart loop.)
+        recovered = await self.worker.recover()
+        if recovered:
+            logger.info(f"Recovered {recovered} in-flight page(s) for redelivery")
+        await self.worker.start()
 
         logger.info("sipgw gateway starting")
 
@@ -119,6 +124,7 @@ class SIPGateway:
             logger.info("Shutting down sipgw...")
             await self.sip_server.stop()
             uvicorn_server.should_exit = True
+            await self.worker.stop()      # stop delivery loop (pending rows persist)
             await self.webhook.close()
             await self.db.close()
 
@@ -142,19 +148,18 @@ def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
     config = load_config(config_path)
 
-    # Setup logging
-    setup_logging(config.logging)
-
     # --- §2 safety gates: dry-run marker + hard production-DB barrier ---
-    # Run BEFORE anything constructs the database or does network I/O.
     from .safety import (
-        effective_dry_run, install_test_marker,
-        assert_safe_database_path, DRY_RUN_BANNER,
+        effective_dry_run, assert_safe_database_path, DRY_RUN_BANNER,
     )
     dry_run = effective_dry_run(config.fusion.dry_run)
+
+    # Configure logging with the [TEST] marker installed FIRST when in dry-run,
+    # so every line (including logging's own init lines) is marked.
+    setup_logging(config.logging, dry_run=dry_run)
     if dry_run:
-        install_test_marker()          # every subsequent log line is [TEST]-marked
         logger.critical(DRY_RUN_BANNER)
+
     # Refuse to start if dry-run/test mode would write to the production DB.
     assert_safe_database_path(config.database.path, dry_run)
 

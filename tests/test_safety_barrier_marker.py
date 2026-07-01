@@ -48,6 +48,16 @@ class TestMarker:
         assert out == "[TEST] once"
         assert out.count("[TEST]") == 1
 
+    def test_every_line_of_multiline_record_is_marked(self):
+        # SIP/API dumps are multi-line; no continuation line may be unmarked.
+        lg, buf = _isolated_logger("sipgw.mark_ml")
+        install_test_marker(lg.name)
+        lg.info(">>> SEND to %s (%s)\n%s", "127.0.0.1:5062", "udp",
+                "INVITE sip:gw SIP/2.0\r\nVia: x\r\nFrom: y")
+        lines = [ln for ln in buf.getvalue().split("\n") if ln.strip()]
+        assert lines, "expected output"
+        assert all(ln.startswith("[TEST] ") for ln in lines), lines
+
     def test_install_is_idempotent(self):
         lg, buf = _isolated_logger("sipgw.mark_d")
         install_test_marker(lg.name)

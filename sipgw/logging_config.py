@@ -61,18 +61,28 @@ class CompressingTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHand
                 logging.getLogger("sipgw.logging").error(f"Failed to clean up {path}: {e}")
 
 
-def setup_logging(config: Optional[LoggingConfig] = None) -> None:
+def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False) -> None:
     """Configure logging for the application.
 
     Sets up:
     - Console handler (stdout) with INFO level
     - File handler with daily rotation at midnight ET, .tgz compression, 90-day retention
+
+    When ``dry_run`` is True, the [TEST] marker is installed on the sipgw loggers
+    FIRST, so every line this function itself emits is also marked (§2b: every
+    log line during testing must carry [TEST]).
     """
     if config is None:
         config = LoggingConfig()
 
     root_logger = logging.getLogger("sipgw")
     root_logger.setLevel(logging.DEBUG)
+
+    if dry_run:
+        # Attach to the loggers before any line is emitted or any handler added;
+        # the logger-level filter marks records before they reach handlers.
+        from .safety import install_test_marker
+        install_test_marker()
 
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -159,5 +169,13 @@ def setup_logging(config: Optional[LoggingConfig] = None) -> None:
     elif not config.sip_debug_log:
         sip_logger.addHandler(logging.NullHandler())
         root_logger.info("SIP debug logging disabled")
+
+    if dry_run:
+        # Second install now that all handlers exist: attaches the [TEST] filter
+        # to every handler so child-logger records (sipgw.main, sipgw.webhook,
+        # sipgw.delivery, ...) are marked too. The early logger-level install
+        # already covers lines logged directly on the sipgw logger above.
+        from .safety import install_test_marker
+        install_test_marker()
 
     root_logger.info("Logging initialized")
