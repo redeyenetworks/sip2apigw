@@ -5,4 +5,10 @@ venv/
 .pytest_cache/
 *.egg-info/
 .claude/
+# Per-install, authoritative-on-each-box config. Never tracked so a deploy
+# (git checkout) can't clobber a site's customized settings. Templates are
+# config.yaml.example and lookups.yaml.example.
 config.yaml
+lookups.yaml
+# Staging runtime (DB, logs, backups) — never part of the repo.
+var/
