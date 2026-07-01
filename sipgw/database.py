@@ -30,14 +30,23 @@ def _utc_rfc3339(epoch: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+_HOST_TZ_SENTINELS = {"", "host", "local", "system"}
+
+
 def _resolve_tz(tzname: str):
-    if ZoneInfo is not None:
+    """Resolve the display / day-boundary timezone.
+
+    Empty or 'host'/'local'/'system' -> the HOST's configured local timezone
+    (we ask the host rather than assuming a zone; hosts are expected to be UTC).
+    An explicit IANA name (e.g. 'America/New_York') overrides per-install.
+    """
+    name = (tzname or "").strip()
+    if name.lower() not in _HOST_TZ_SENTINELS and ZoneInfo is not None:
         try:
-            return ZoneInfo(tzname)
+            return ZoneInfo(name)
         except Exception:
             pass
-    # Fallback: aware local timezone.
-    return datetime.now().astimezone().tzinfo
+    return datetime.now().astimezone().tzinfo   # host local
 
 
 def _day_start_epoch(tzname: str) -> float:
@@ -102,9 +111,9 @@ STATE_LEGACY = "legacy"
 class CallDatabase:
     """Async SQLite database for storing call records."""
 
-    def __init__(self, db_path: str, timezone: str = "America/New_York"):
+    def __init__(self, db_path: str, timezone: str = ""):
         self.db_path = db_path
-        self.timezone = timezone           # #12 day-boundary + display zone
+        self.timezone = timezone           # #12 day-boundary + display zone ("" = host)
         self._db: Optional[aiosqlite.Connection] = None
 
     async def initialize(self) -> None:

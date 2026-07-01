@@ -55,7 +55,7 @@ class LoggingConfig:
     log_dir: str = "/var/log/sipgw"
     retention_days: int = 90
     rotation_time: str = "midnight"
-    timezone: str = "America/New_York"
+    timezone: str = ""   # #12 display/day-boundary zone; "" = read the host's local tz
     api_debug_log: bool = True
     sip_debug_log: bool = True
 

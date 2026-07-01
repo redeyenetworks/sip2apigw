@@ -30,7 +30,7 @@ logging:
   log_dir: "/var/log/sipgw"
   retention_days: 90
   rotation_time: "midnight"
-  timezone: "America/New_York"
+  timezone: ""              # empty = host local tz (hosts are UTC); set an IANA name to override
   api_debug_log: true
   sip_debug_log: true
 

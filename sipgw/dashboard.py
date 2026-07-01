@@ -657,7 +657,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
 
         # #12: stored timestamps are UTC; nurses see local wall time derived
         # from the canonical created_at epoch (not the raw stored string).
-        tz_name = log_config.timezone if log_config else "America/New_York"
+        tz_name = log_config.timezone if log_config else ""   # "" = host local
         for c in calls:
             c["display_time"] = display_local(c.get("created_at"), tz_name)
 

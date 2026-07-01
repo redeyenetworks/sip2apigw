@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 
 from sipgw.database import (
-    CallDatabase, _utc_rfc3339, _day_start_epoch, display_local,
+    CallDatabase, _utc_rfc3339, _day_start_epoch, display_local, _resolve_tz,
 )
 
 _UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
@@ -83,6 +83,16 @@ class TestZoneAndDst:
     def test_day_start_is_zone_aware_not_process_tz(self):
         # NY midnight and Tokyo midnight are different UTC instants.
         assert _day_start_epoch("America/New_York") != _day_start_epoch("Asia/Tokyo")
+
+    def test_empty_timezone_resolves_to_host(self):
+        import datetime
+        host = datetime.datetime.now().astimezone().tzinfo
+        assert str(_resolve_tz("")) == str(host)
+        assert str(_resolve_tz("host")) == str(host)
+        assert str(_resolve_tz("local")) == str(host)
+
+    def test_explicit_zone_overrides_host(self):
+        assert str(_resolve_tz("America/New_York")) == "America/New_York"
 
     def test_display_local_dst_correct(self):
         # Winter (EST, UTC-5): 12:00Z -> 07:00 local.
