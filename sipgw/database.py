@@ -86,6 +86,15 @@ CREATE_STATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_calls_state ON calls(state)
 """
 
+# #7 liveness heartbeat. The writer process stamps beat_at (epoch); the (soon
+# decoupled, #14) dashboard reads it and reports /health stale if it ages out.
+CREATE_HEARTBEAT = """
+CREATE TABLE IF NOT EXISTS heartbeat (
+    name TEXT PRIMARY KEY,
+    beat_at REAL NOT NULL
+)
+"""
+
 # #2 durable-delivery columns, added idempotently to the existing `calls` table.
 # ADD COLUMN fills pre-existing rows with the DEFAULT, so the 301 legacy prod
 # rows become state='legacy', attempts=0, is_test=0 without data loss.
@@ -132,6 +141,7 @@ class CallDatabase:
 
         await self._db.execute(CREATE_TABLE)
         await self._db.execute(CREATE_INDEX)
+        await self._db.execute(CREATE_HEARTBEAT)
         await self._migrate()
         await self._db.commit()
 
@@ -411,6 +421,24 @@ class CallDatabase:
             "expired": by_state.get(STATE_EXPIRED, 0),
             "by_state": by_state,
         }
+
+    async def write_heartbeat(self, name: str = "writer") -> float:
+        """Stamp the writer's liveness heartbeat (epoch). Returns the beat time."""
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO heartbeat (name, beat_at) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at",
+            (name, now),
+        )
+        await self._db.commit()
+        return now
+
+    async def read_heartbeat(self, name: str = "writer") -> Optional[float]:
+        """Read the last heartbeat epoch for ``name`` (None if never stamped)."""
+        cur = await self._db.execute(
+            "SELECT beat_at FROM heartbeat WHERE name=?", (name,))
+        row = await cur.fetchone()
+        return row[0] if row else None
 
     async def close(self) -> None:
         """Close the database connection."""

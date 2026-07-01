@@ -5,6 +5,7 @@ log viewers, and health endpoint. No authentication required.
 """
 
 import os
+import time
 import logging
 import yaml
 from pathlib import Path
@@ -629,7 +630,9 @@ def _read_log_tail(log_path: str, num_lines: int = 50) -> list[str]:
         return []
 
 
-def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Optional[LoggingConfig] = None) -> FastAPI:
+def create_dashboard(db: CallDatabase, config: DashboardConfig,
+                     log_config: Optional[LoggingConfig] = None,
+                     health_config=None) -> FastAPI:
     """Create the FastAPI dashboard application."""
     from jinja2 import Environment
 
@@ -713,8 +716,18 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             headers={"Content-Disposition": "attachment; filename=lookups-sample.yaml"},
         )
 
+    stale_after = getattr(health_config, "stale_after_seconds", 30.0)
+
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        # #7 real liveness: healthy only if the writer's heartbeat is fresh.
+        beat = await db.read_heartbeat("writer")
+        if beat is None:
+            return JSONResponse(status_code=503, content={"status": "no-heartbeat"})
+        age = time.time() - beat
+        if age > stale_after:
+            return JSONResponse(status_code=503,
+                                content={"status": "stale", "heartbeat_age_s": round(age, 1)})
+        return {"status": "ok", "heartbeat_age_s": round(age, 1)}
 
     return app

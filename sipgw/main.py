@@ -40,8 +40,21 @@ class SIPGateway:
         self.worker = DeliveryWorker(self.db, self.webhook, config.delivery,
                                      on_escalate=self.escalator.escalate)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
-        self.dashboard = create_dashboard(self.db, config.dashboard, config.logging)
+        self.dashboard = create_dashboard(self.db, config.dashboard, config.logging,
+                                          config.health)
+        self._hb_task = None           # #7 heartbeat writer
         self._shutdown_event = asyncio.Event()
+
+    async def _heartbeat_loop(self):
+        interval = self.config.health.heartbeat_interval_seconds
+        while True:
+            try:
+                await self.db.write_heartbeat("writer")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("heartbeat write failed")
+            await asyncio.sleep(interval)
 
     async def on_call(
         self,
@@ -100,6 +113,11 @@ class SIPGateway:
             logger.info(f"Recovered {recovered} in-flight page(s) for redelivery")
         await self.worker.start()
 
+        # #7 stamp an initial heartbeat BEFORE the dashboard serves /health,
+        # then keep it fresh on a background loop.
+        await self.db.write_heartbeat("writer")
+        self._hb_task = asyncio.create_task(self._heartbeat_loop())
+
         logger.info("sipgw gateway starting")
 
         # Run SIP server and dashboard concurrently
@@ -130,6 +148,12 @@ class SIPGateway:
             await self.sip_server.stop()
             uvicorn_server.should_exit = True
             await self.worker.stop()      # stop delivery loop (pending rows persist)
+            if self._hb_task:
+                self._hb_task.cancel()
+                try:
+                    await self._hb_task
+                except asyncio.CancelledError:
+                    pass
             await self.webhook.close()
             await self.escalator.close()
             await self.db.close()

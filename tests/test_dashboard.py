@@ -44,6 +44,8 @@ def mock_db():
     db.get_recent_calls = AsyncMock(return_value=SAMPLE_CALLS)
     db.get_calls_page = AsyncMock(return_value=(SAMPLE_CALLS, 2, 1))
     db.get_today_stats = AsyncMock(return_value={"success": 50, "failed": 3, "pending": 7})
+    import time as _t
+    db.read_heartbeat = AsyncMock(return_value=_t.time())   # #7 fresh heartbeat
     return db
 
 

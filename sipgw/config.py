@@ -97,12 +97,20 @@ class EscalationConfig:
 
 
 @dataclass
+class HealthConfig:
+    """#7 liveness heartbeat + /health staleness."""
+    heartbeat_interval_seconds: float = 10.0
+    stale_after_seconds: float = 30.0
+
+
+@dataclass
 class AppConfig:
     sip: SIPConfig = field(default_factory=SIPConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -134,6 +142,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             "tts": config.tts,
             "delivery": config.delivery,
             "escalation": config.escalation,
+            "health": config.health,
             "logging": config.logging,
             "dashboard": config.dashboard,
             "database": config.database,
