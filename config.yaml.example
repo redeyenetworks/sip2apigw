@@ -42,3 +42,11 @@ dashboard:
 
 database:
   path: "/var/lib/sipgw/calls.db"
+
+escalation:
+  # Human alert channel for pages that fail delivery or expire
+  # (Teams/Slack/PagerDuty/NOC webhook). Empty disables escalation
+  # (failures are still logged at ERROR). In dry-run the escalation client
+  # carries the no-send guard, so this URL is blocked in testing.
+  webhook_url: ""
+  timeout_seconds: 10.0

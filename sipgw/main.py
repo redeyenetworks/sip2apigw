@@ -20,6 +20,7 @@ from .tts_builder import build_tts, assemble_tts
 from .sip_server import SIPServer
 from .dashboard import create_dashboard
 from .delivery import DeliveryWorker
+from .escalation import Escalator
 from .safety import effective_dry_run
 
 logger = logging.getLogger("sipgw.main")
@@ -33,9 +34,11 @@ class SIPGateway:
         self._dry_run = effective_dry_run(config.fusion.dry_run)
         self.db = CallDatabase(config.database.path)
         self.webhook = FusionWebhook(config.fusion)
-        # #2 durable delivery. Escalation (#3) is wired in later as on_escalate.
+        # #3 escalation, shares the no-send guard in dry-run.
+        self.escalator = Escalator(config.escalation, dry_run=self._dry_run)
+        # #2 durable delivery escalates via the Escalator on failed/expired.
         self.worker = DeliveryWorker(self.db, self.webhook, config.delivery,
-                                     on_escalate=None)
+                                     on_escalate=self.escalator.escalate)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
         self.dashboard = create_dashboard(self.db, config.dashboard, config.logging)
         self._shutdown_event = asyncio.Event()
@@ -86,6 +89,7 @@ class SIPGateway:
         # Initialize components
         await self.db.initialize()
         await self.webhook.initialize()
+        await self.escalator.initialize()          # #3 escalation client
         await self.webhook.start_token_refresh()   # #4 keep the token warm
 
         # #2 durable delivery: recover crash-orphaned rows, then start the worker.
@@ -127,6 +131,7 @@ class SIPGateway:
             uvicorn_server.should_exit = True
             await self.worker.stop()      # stop delivery loop (pending rows persist)
             await self.webhook.close()
+            await self.escalator.close()
             await self.db.close()
 
             # Give tasks a moment to finish

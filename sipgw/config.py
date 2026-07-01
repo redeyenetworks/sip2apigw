@@ -85,11 +85,24 @@ class DeliveryConfig:
 
 
 @dataclass
+class EscalationConfig:
+    """#3 escalation: alert a human channel when a page cannot be delivered.
+
+    webhook_url points at a Teams/Slack/PagerDuty/NOC endpoint. Empty disables
+    escalation (failures are still logged at ERROR). In dry-run the escalation
+    client carries the §2a no-send guard, so this URL is blocked in testing.
+    """
+    webhook_url: str = ""
+    timeout_seconds: float = 10.0
+
+
+@dataclass
 class AppConfig:
     sip: SIPConfig = field(default_factory=SIPConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
+    escalation: EscalationConfig = field(default_factory=EscalationConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -120,6 +133,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             "fusion": config.fusion,
             "tts": config.tts,
             "delivery": config.delivery,
+            "escalation": config.escalation,
             "logging": config.logging,
             "dashboard": config.dashboard,
             "database": config.database,
@@ -189,6 +203,13 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
         errors.append(f"delivery.poll_interval_seconds must be > 0 (got {d.poll_interval_seconds})")
     if d.max_age_seconds <= 0:
         warnings.append(f"delivery.max_age_seconds is {d.max_age_seconds} (<=0)")
+
+    esc = config.escalation
+    if esc.webhook_url and not str(esc.webhook_url).startswith(("http://", "https://")):
+        errors.append(f"escalation.webhook_url must be an http(s) URL (got {esc.webhook_url!r})")
+    if not dry_run and not esc.webhook_url:
+        warnings.append("escalation.webhook_url is not set — failed/expired pages "
+                        "will be logged but not escalated to a human channel")
 
     if not (1 <= config.dashboard.port <= 65535):
         errors.append(f"dashboard.port out of range: {config.dashboard.port}")

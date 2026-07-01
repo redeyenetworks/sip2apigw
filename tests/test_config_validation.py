@@ -15,6 +15,7 @@ def _prod_ok() -> AppConfig:
         audience="prov", scenario_id="scen", scenario_field_id="field",
         client_id="cid", client_secret="secret",
     )
+    c.escalation.webhook_url = "https://hooks.example.com/escalation"
     return c
 
 
@@ -79,5 +80,17 @@ class TestStructuralValidation:
     def test_port_out_of_range_is_fatal(self):
         c = _prod_ok()
         c.dashboard.port = 70000
+        with pytest.raises(ConfigError):
+            validate_config(c, dry_run=False)
+
+    def test_missing_escalation_warns_in_prod(self):
+        c = _prod_ok()
+        c.escalation.webhook_url = ""
+        warnings = validate_config(c, dry_run=False)
+        assert any("escalation.webhook_url" in w for w in warnings)
+
+    def test_bad_escalation_url_is_fatal(self):
+        c = _prod_ok()
+        c.escalation.webhook_url = "hooks.example.com/escalation"  # no scheme
         with pytest.raises(ConfigError):
             validate_config(c, dry_run=False)
