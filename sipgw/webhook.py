@@ -108,6 +108,21 @@ def _log_request(response: httpx.Response, label: str, mask_secrets: bool = True
     api_debug.info("-" * 72)
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header.
+
+    Only the delta-seconds form is honored. The HTTP-date form returns None so
+    the delivery worker falls back to its exponential backoff (runbook note).
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return secs if secs >= 0 else None
+
+
 class FusionWebhook:
     """Client for Informacast Fusion Scenarios API with OAuth2 auth."""
 
@@ -119,6 +134,9 @@ class FusionWebhook:
         self._token_lock = asyncio.Lock()
         self._dry_run: bool = False
         self._transport = None  # NoSendGuardTransport when dry-run is active
+        # Delta-seconds parsed from the last response's Retry-After header (or
+        # None). Read by the #2 delivery worker to schedule the next attempt.
+        self.last_retry_after: Optional[float] = None
 
     async def initialize(self) -> None:
         """Create the HTTP client.
@@ -276,6 +294,7 @@ class FusionWebhook:
             await self.initialize()
 
         start_time = time.monotonic()
+        self.last_retry_after = None
         url = self.config.base_url.rstrip("/") + self.config.scenario_endpoint
 
         try:
@@ -321,6 +340,8 @@ class FusionWebhook:
 
                 logger.info(f"Fusion webhook retry: status={response.status_code}")
 
+            # Surface Retry-After (delta-seconds only) for the delivery worker.
+            self.last_retry_after = _parse_retry_after(response.headers.get("Retry-After"))
             return response.status_code, elapsed_ms
 
         except Exception as e:

@@ -71,10 +71,22 @@ class DatabaseConfig:
 
 
 @dataclass
+class DeliveryConfig:
+    """#2 durable-delivery retry worker tuning."""
+    max_attempts: int = 6            # attempts before a page is marked 'failed' + escalated
+    base_backoff_seconds: float = 2.0
+    max_backoff_seconds: float = 60.0
+    max_age_seconds: float = 900.0   # undelivered longer than this -> 'expired' + escalate
+    poll_interval_seconds: float = 1.0
+    batch_size: int = 20
+
+
+@dataclass
 class AppConfig:
     sip: SIPConfig = field(default_factory=SIPConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -104,6 +116,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             "sip": config.sip,
             "fusion": config.fusion,
             "tts": config.tts,
+            "delivery": config.delivery,
             "logging": config.logging,
             "dashboard": config.dashboard,
             "database": config.database,
