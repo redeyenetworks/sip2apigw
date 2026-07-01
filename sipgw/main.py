@@ -21,6 +21,7 @@ from .sip_server import SIPServer
 from .dashboard import create_dashboard
 from .delivery import DeliveryWorker
 from .escalation import Escalator
+from .watchdog import notify_ready, notify_stopping, WatchdogPinger
 from .safety import effective_dry_run
 
 logger = logging.getLogger("sipgw.main")
@@ -43,6 +44,7 @@ class SIPGateway:
         self.dashboard = create_dashboard(self.db, config.dashboard, config.logging,
                                           config.health)
         self._hb_task = None           # #7 heartbeat writer
+        self.watchdog = WatchdogPinger()   # #8 systemd watchdog (inert w/o systemd)
         self._shutdown_event = asyncio.Event()
 
     async def _heartbeat_loop(self):
@@ -105,25 +107,9 @@ class SIPGateway:
         await self.escalator.initialize()          # #3 escalation client
         await self.webhook.start_token_refresh()   # #4 keep the token warm
 
-        # #2 durable delivery: recover crash-orphaned rows, then start the worker.
-        # (When #8 watchdog lands, systemd READY=1 must be sent BEFORE recover so
-        # a large recovery cannot trip the watchdog into a restart loop.)
-        recovered = await self.worker.recover()
-        if recovered:
-            logger.info(f"Recovered {recovered} in-flight page(s) for redelivery")
-        await self.worker.start()
-
-        # #7 stamp an initial heartbeat BEFORE the dashboard serves /health,
-        # then keep it fresh on a background loop.
-        await self.db.write_heartbeat("writer")
-        self._hb_task = asyncio.create_task(self._heartbeat_loop())
-
-        logger.info("sipgw gateway starting")
-
-        # Run SIP server and dashboard concurrently
+        # Start the SIP listener + dashboard FIRST so pages can be received.
         sip_task = asyncio.create_task(self.sip_server.start())
 
-        # Run uvicorn in the same event loop
         uvicorn_config = uvicorn.Config(
             app=self.dashboard,
             host=self.config.dashboard.bind_ip,
@@ -133,10 +119,27 @@ class SIPGateway:
         )
         uvicorn_server = uvicorn.Server(uvicorn_config)
         dashboard_task = asyncio.create_task(uvicorn_server.serve())
-
         logger.info(
             f"Dashboard running on http://{self.config.dashboard.bind_ip}:{self.config.dashboard.port}"
         )
+
+        # #7 stamp an initial heartbeat before /health is consulted.
+        await self.db.write_heartbeat("writer")
+        self._hb_task = asyncio.create_task(self._heartbeat_loop())
+
+        # #8 tell systemd we are up and start watchdog pings BEFORE recovery.
+        # A large recover() must not delay READY (watchdog restart loop); the
+        # pinger then proves event-loop liveness independently of recovery.
+        notify_ready()
+        await self.watchdog.start()
+
+        # #2 durable delivery: recover crash-orphaned rows, then start the worker.
+        recovered = await self.worker.recover()
+        if recovered:
+            logger.info(f"Recovered {recovered} in-flight page(s) for redelivery")
+        await self.worker.start()
+
+        logger.info("sipgw gateway starting")
 
         # Wait for shutdown signal
         try:
@@ -145,6 +148,8 @@ class SIPGateway:
             pass
         finally:
             logger.info("Shutting down sipgw...")
+            notify_stopping()             # #8 tell systemd we're stopping
+            await self.watchdog.stop()
             await self.sip_server.stop()
             uvicorn_server.should_exit = True
             await self.worker.stop()      # stop delivery loop (pending rows persist)

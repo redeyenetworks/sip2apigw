@@ -3,9 +3,16 @@ Description=sipgw - SIP-to-Webhook Gateway for Informacast Fusion
 Documentation=file:///opt/sipgw/docs/ARCHITECTURE.md
 After=network-online.target
 Wants=network-online.target
+# Life-safety pager: never let start-rate limiting wedge it in 'failed'.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# #8 Type=notify: the app sends READY=1 once listeners are up, and pings the
+# watchdog on a cadence (WATCHDOG_USEC/2). A hung event loop is detected and
+# the pager is restarted.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
 User=sipgw
 Group=sipgw
 WorkingDirectory=/opt/sipgw
