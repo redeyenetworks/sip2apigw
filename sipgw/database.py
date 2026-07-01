@@ -315,6 +315,67 @@ class CallDatabase:
         await self._db.commit()
         return cur.rowcount
 
+    # ------------------------------------------------------------- #5 dedupe
+    async def find_recent_duplicate(
+        self, *, area_number: Optional[str], room_number: Optional[str],
+        bed_number: Optional[str], purpose: str, is_test: int,
+        since_epoch: float, exclude_id: Optional[int] = None,
+        match_bed: bool = True, match_purpose: bool = True,
+    ) -> Optional[int]:
+        """#5 SHADOW clinical-dedupe lookup — TEST-ONLY path.
+
+        Find the earliest PRIOR row with the same clinical identity created
+        within the window (``created_at >= since_epoch`` — keyed off the numeric
+        epoch per #12, NEVER the timestamp string), excluding the just-inserted
+        row (``exclude_id``). Returns that row's id, or None.
+
+        area/room are stored columns and matched in SQL (leading zeros preserved
+        by exact string match). bed and purpose are not stored as columns, so
+        the row's ``caller_id`` (which encodes the bed) and ``display_name``
+        (from which the purpose derives) are re-parsed and compared in Python,
+        honoring ``match_bed`` / ``match_purpose``.
+
+        This is NON-suppressing telemetry: in prod ``window_seconds`` is 0 so it
+        is never called, and even when it returns a match main.py never skips or
+        delays delivery — a real second Code Blue is always sent.
+        """
+        from .parser import parse_caller_username
+        from .lookups import get_call_purpose
+
+        sql = ("SELECT id, caller_id, display_name FROM calls "
+               "WHERE area_number IS ? AND room_number IS ? AND is_test=? "
+               "AND created_at >= ?")
+        params: list = [area_number, room_number, is_test, since_epoch]
+        if exclude_id is not None:
+            sql += " AND id != ?"
+            params.append(exclude_id)
+        sql += " ORDER BY id ASC"
+
+        cur = await self._db.execute(sql, tuple(params))
+        rows = await cur.fetchall()
+
+        want_purpose = (purpose or "").strip().lower()
+        for row in rows:
+            if match_bed:
+                _, _, cand_bed, _ = parse_caller_username(row["caller_id"] or "")
+                if (cand_bed or None) != (bed_number or None):
+                    continue
+            if match_purpose:
+                cand_purpose = get_call_purpose(row["display_name"] or "").strip().lower()
+                if cand_purpose != want_purpose:
+                    continue
+            return row["id"]
+        return None
+
+    async def record_duplicate_of(self, call_id: int, duplicate_of: int) -> None:
+        """#5 SHADOW telemetry: annotate a row with the id of a prior clinical
+        duplicate. Purely informational — it does NOT change delivery ``state``
+        and NEVER gates, delays, or skips delivery of this page.
+        """
+        await self._db.execute(
+            "UPDATE calls SET duplicate_of=? WHERE id=?", (duplicate_of, call_id))
+        await self._db.commit()
+
     async def get_call(self, call_id: int) -> Optional[Dict[str, Any]]:
         cur = await self._db.execute("SELECT * FROM calls WHERE id=?", (call_id,))
         row = await cur.fetchone()

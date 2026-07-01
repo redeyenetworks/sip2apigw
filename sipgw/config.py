@@ -104,6 +104,23 @@ class HealthConfig:
 
 
 @dataclass
+class DedupeConfig:
+    """#5 clinical dedupe — ships SHADOW/DISABLED.
+
+    A real second Code Blue for the same room must NEVER be dropped, so this is
+    inert by default: ``enforce`` False (never suppresses) and ``window_seconds``
+    0 (the shadow lookup never even runs). Enforcement requires clinical
+    sign-off and is FORBIDDEN today — validate_config makes ``enforce=True``
+    fatal. ``window_seconds`` > 0 is a test-only override that turns the shadow
+    'WOULD suppress' telemetry on; delivery still always proceeds.
+    """
+    enforce: bool = False
+    window_seconds: int = 0
+    match_bed: bool = True
+    match_purpose: bool = True
+
+
+@dataclass
 class AppConfig:
     sip: SIPConfig = field(default_factory=SIPConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
@@ -111,6 +128,7 @@ class AppConfig:
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     escalation: EscalationConfig = field(default_factory=EscalationConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    dedupe: DedupeConfig = field(default_factory=DedupeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -143,6 +161,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             "delivery": config.delivery,
             "escalation": config.escalation,
             "health": config.health,
+            "dedupe": config.dedupe,
             "logging": config.logging,
             "dashboard": config.dashboard,
             "database": config.database,
@@ -219,6 +238,14 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
     if not dry_run and not esc.webhook_url:
         warnings.append("escalation.webhook_url is not set — failed/expired pages "
                         "will be logged but not escalated to a human channel")
+
+    # #5 clinical dedupe enforcement is not approved for production use — a
+    # suppressed page is a missed Code Blue. It requires clinical sign-off and
+    # is forbidden today in ALL modes (dry-run included). Shadow-only.
+    if config.dedupe.enforce:
+        errors.append(
+            "dedupe.enforce must be False — clinical dedupe SUPPRESSION is not "
+            "approved (requires clinical sign-off); ships SHADOW only")
 
     if not (1 <= config.dashboard.port <= 65535):
         errors.append(f"dashboard.port out of range: {config.dashboard.port}")

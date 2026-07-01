@@ -21,6 +21,7 @@ from .sip_server import SIPServer
 from .dashboard import create_dashboard
 from .delivery import DeliveryWorker
 from .escalation import Escalator
+from .dedupe import Deduper
 from .watchdog import notify_ready, notify_stopping, WatchdogPinger
 from .safety import effective_dry_run
 
@@ -40,6 +41,9 @@ class SIPGateway:
         # #2 durable delivery escalates via the Escalator on failed/expired.
         self.worker = DeliveryWorker(self.db, self.webhook, config.delivery,
                                      on_escalate=self.escalator.escalate)
+        # #5 clinical dedupe — SHADOW/DISABLED. Constructed once; used AFTER the
+        # record-first insert as pure telemetry. It never gates delivery.
+        self.deduper = Deduper(config.dedupe)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
         self.dashboard = create_dashboard(self.db, config.dashboard, config.logging,
                                           config.health)
@@ -96,6 +100,30 @@ class SIPGateway:
             sip_call_id=call_id,
             is_test=1 if self._dry_run else 0,
         )
+
+        # #5 clinical dedupe — SHADOW/DISABLED. Runs AFTER the record-first
+        # insert (record-first is sacred; the insert is never gated). This is
+        # NON-suppressing telemetry: it may annotate duplicate_of and log, but
+        # it NEVER skips or delays delivery — the worker still delivers this
+        # pending row, so a real second Code Blue for the same room is sent.
+        try:
+            from .lookups import get_call_purpose
+            decision = await self.deduper.evaluate(
+                self.db,
+                caller=caller,
+                purpose=get_call_purpose(caller.display_name),
+                row_id=row_id,
+                is_test=1 if self._dry_run else 0,
+            )
+            if decision.duplicate_of is not None:
+                await self.db.record_duplicate_of(row_id, decision.duplicate_of)
+                logger.info(
+                    "Call %s (row %s) is a clinical duplicate of row %s "
+                    "(fp=%s) — delivering anyway (SHADOW)",
+                    call_id, row_id, decision.duplicate_of, decision.fingerprint)
+        except Exception:
+            logger.exception(
+                "dedupe evaluate failed for row %s — delivering anyway", row_id)
 
         logger.info(f"Call {call_id} recorded PENDING (row {row_id}): tts='{tts}'")
 

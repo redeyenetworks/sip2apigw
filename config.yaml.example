@@ -51,6 +51,17 @@ escalation:
   webhook_url: ""
   timeout_seconds: 10.0
 
+# --- #5 clinical dedupe (SHADOW / DISABLED) --------------------------------
+# SAFETY: a real second Code Blue for the same room must NEVER be dropped.
+# This ships inert: enforce=false (never suppresses) and window_seconds=0
+# (the shadow duplicate lookup never even runs). Setting enforce=true is a
+# FATAL config error — suppression requires clinical sign-off and is not
+# approved. window_seconds > 0 only turns on 'WOULD suppress' shadow telemetry;
+# every page is still delivered.
+dedupe:
+  enforce: false
+  window_seconds: 0
+
 # --- #12 timestamps note ---------------------------------------------------
 # Stored call `timestamp` is canonical UTC RFC3339 millis-Z. The dashboard
 # displays LOCAL wall-clock (and the "today" boundary is computed) using
