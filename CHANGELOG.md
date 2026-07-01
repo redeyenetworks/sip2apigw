@@ -4,6 +4,114 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.0] — 2026-07-01
+
+Reliability + observability release. The gateway moves from best-effort,
+single-process paging to a **durable, record-first delivery pipeline** with retry,
+escalation, and a decoupled read-only dashboard. Every change here preserves the
+life-safety invariants: no real outbound send in dev/test (`NoSendGuardTransport`),
+`[TEST]`-marked logs and `is_test=1` rows under dry-run, the prod-DB path barrier on
+every DB open, and — above all — **a real page is never dropped, duplicated, or gated
+by any new machinery.**
+
+### Added
+- **Durable, record-first delivery (#2)** — `on_call` now writes the page to the DB
+  in state `pending` **before** any delivery is attempted (`main.py` record-first
+  path). A background `DeliveryWorker` (`delivery.py`) drives the state machine
+  `pending → delivering → delivered | failed | expired` (`database.py`, WAL mode,
+  idempotent schema migration; legacy rows carry state `legacy`). If the process
+  restarts, `recover()` re-queues in-flight pages so nothing is lost.
+- **Retry with exponential backoff (#2)** — failed attempts retry with
+  `base_backoff_seconds` (default 2.0s) doubling up to `max_backoff_seconds`
+  (default 60s), honoring an upstream `Retry-After` delta-seconds when present.
+  After `delivery.max_attempts` (default 6) a page is marked `failed`; a page
+  undelivered past `delivery.max_age_seconds` (default 900s) is marked `expired`.
+  Poll cadence is `poll_interval_seconds` (default 1.0s).
+- **Escalation on failed/expired pages (#3)** — `escalation.py` posts to a human
+  alert channel (`escalation.webhook_url` — Teams/Slack/PagerDuty/NOC) when a page
+  ends in `failed` or `expired`. Empty URL disables escalation (failures still
+  logged at ERROR). In dry-run the escalation HTTP client is routed through the
+  no-send guard like every other client.
+- **Background OAuth2 token refresh (#4)** — the token is refreshed proactively
+  `fusion.token_refresh_margin_seconds` (default 300s) before expiry (`webhook.py`),
+  so a page never blocks on a token round-trip on the hot path.
+- **Clinical dedupe in SHADOW / DISABLED (#5)** — `dedupe.py` computes a stable
+  **clinical** fingerprint `cf-v1:<hex>` over the normalized
+  (area, room, bed, purpose) tuple — deliberately distinct from #15's SIP
+  transaction fingerprint. It ships **inert** behind two OFF switches:
+  `dedupe.enforce=false` (never suppresses) and `dedupe.window_seconds=0` (the
+  shadow duplicate lookup never even queries the DB). Setting `window_seconds>0` is
+  test-only telemetry that logs `WOULD suppress …` but **still returns no-suppress**;
+  `enforce=true` is out-of-policy and made **fatal** by `validate_config`. The
+  deduper runs *after* `create_pending_call` and never gates the insert — **a real
+  second Code Blue for the same room is always delivered.**
+- **Async logging (#6)** — a non-blocking `QueueHandler` moves all file writes,
+  rotation, and gzip compression off the event loop (`logging_config.py`;
+  `CompressingTimedRotatingFileHandler` on `sipgw.log`, `sipgw_api_debug.log`,
+  `sipgw_sip_debug.log`).
+- **Real `/health` backed by a writer heartbeat (#7)** — the writer stamps a
+  `heartbeat` row every `dashboard.heartbeat_interval_seconds` (default 10s;
+  `database.write_heartbeat`); the dashboard's `/health` reads it
+  (`read_heartbeat`) and reports unhealthy if older than
+  `dashboard.stale_after_seconds` (default 30s) — a single source of truth, no
+  duplicate dashboard key.
+- **systemd `Type=notify` watchdog (#8)** — `watchdog.py`; `main` sends `READY=1`
+  once listeners are up (before `recover()`) and pings `WATCHDOG` on a cadence, so
+  a hung event loop is detected and the writer restarted. Fully inert without real
+  systemd (containers/CI). `StartLimitIntervalSec=0` keeps start-rate limiting from
+  ever wedging the life-safety pager in `failed`.
+- **Startup config validation (#9)** — `validate_config` fails fatally on invalid
+  production config (e.g. `max_attempts < 1`, `poll_interval_seconds <= 0`,
+  `dedupe.enforce=true`) and warns on soft issues (e.g. empty
+  `escalation.webhook_url`).
+- **State-aware, test-excluding dashboard stats (#10)** — stats derive from the
+  delivery state machine and exclude `is_test=1` rows; a **Pending** card was added
+  alongside Successful/Failed.
+- **Canonical UTC RFC3339-Z timestamps (#12)** — the writer stamps atomic
+  `…Z` UTC timestamps (`database._utc_rfc3339`); day-boundary bucketing keys off
+  the numeric `created_at` epoch (`_day_start_epoch`), and the dashboard renders
+  **host-local** time ("Time (local)", `display_local`). `logging.timezone=""`
+  means host-local (hosts are UTC); an IANA name overrides.
+- **Two-service split: writer + read-only dashboard (#14)** — the dashboard is now
+  a separate process (`dashboard_app.py`, `sipgw-dashboard.service`) that opens the
+  DB **read-only** (`query_only`) and only reads the writer's heartbeat. The sd_notify
+  watchdog stays exclusively on the life-safety writer (`sipgw.service`). The
+  dashboard runs under its own `MemoryMax=256M` / `CPUQuota=50%` envelope so a
+  runaway UI request cannot starve the writer (enforced only under real systemd
+  cgroups; inert in CI/containers).
+- **Dashboard view toggle + CSV export (#13-P1)** — Summary/Advanced view toggle
+  (invalid `view` values fall back to `summary`, never a 500) and an `/export.csv`
+  endpoint.
+- **Stable INVITE fingerprint (#15)** — `invite_fingerprint(msg)` (`sip_message.py`)
+  yields a `v1:<hex>` SIP **transaction** identity (Call-ID/From/CSeq) for
+  correlation and as the basis for #5. Kept clearly separate from #5's `cf-v1:`
+  clinical identity.
+
+### Changed
+- `on_call` is now record-first: the DB insert precedes delivery and is never
+  gated by dedupe or any downstream check.
+- Dashboard is decoupled from the writer and can be restarted independently
+  without affecting paging.
+
+### Safety / invariants
+- Dry-run can only be **enabled**, never disabled; any new HTTP client
+  (escalation) uses the `NoSendGuardTransport`. All test logs are `[TEST]`-marked
+  and all test rows are `is_test=1`. The prod-DB path barrier
+  (`assert_safe_database_path`) runs on **every** DB open, including the dashboard's
+  read-only connection. SIP IP allowlist, credential masking, and Jinja
+  `autoescape=True` are unchanged.
+
+### Deferred / gated on humans + real hosts
+- **Real-systemd watchdog + OOM isolation drills** — the `Type=notify` watchdog and
+  the dashboard `MemoryMax`/`CPUQuota` envelope are inert in CI/containers and must
+  be exercised under real systemd with cgroup controllers before cutover.
+- **#5 dedupe enforcement** stays SHADOW/DISABLED until clinical sign-off **and** a
+  real Rauland INVITE capture validate the clinical fingerprint against production
+  traffic; suppression is `validate_config`-forbidden today.
+- **Production cutover** of the two-service split remains a manual, operator-run step.
+
+---
+
 ## [v1.5.1] — 2026-03-24
 
 ### Fixed
