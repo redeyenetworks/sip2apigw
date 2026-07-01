@@ -65,14 +65,15 @@ def _log_request(response: httpx.Response, label: str, mask_secrets: bool = True
             body_text = req.content.decode("utf-8", errors="replace")
         except Exception:
             body_text = repr(req.content[:500])
-        # Mask client_secret in form-encoded bodies
-        if mask_secrets and "client_secret=" in body_text:
+        # Mask credentials in form-encoded bodies: client_secret AND client_id.
+        if mask_secrets and isinstance(body_text, str):
             import re
-            body_text = re.sub(
-                r"(client_secret=)[^&]+",
-                lambda m: m.group(1) + m.group(0)[len(m.group(1)):len(m.group(1))+8] + "***",
-                body_text,
-            )
+
+            def _mask(m):
+                return m.group(1) + m.group(2)[:4] + "***"
+
+            body_text = re.sub(r"(client_secret=)([^&]+)", _mask, body_text)
+            body_text = re.sub(r"(client_id=)([^&]+)", _mask, body_text)
         api_debug.info("  Body:    %s", body_text)
     else:
         api_debug.info("  Body:    (empty)")
@@ -223,8 +224,9 @@ class FusionWebhook:
                 logger.error(f"Failed to get OAuth2 token: HTTP {e.response.status_code} - {body[:200]}")
                 raise
             except Exception as e:
-                api_debug.error("TOKEN REQUEST EXCEPTION: %s", e, exc_info=True)
-                logger.error(f"Failed to get OAuth2 token: {e}")
+                api_debug.error("TOKEN REQUEST EXCEPTION: %s: %s",
+                                type(e).__name__, e, exc_info=True)
+                logger.error(f"Failed to get OAuth2 token: {type(e).__name__}: {e}")
                 raise
 
     async def _resolve_field_id(self) -> str:
@@ -346,6 +348,8 @@ class FusionWebhook:
 
         except Exception as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000
-            api_debug.error("SCENARIO TRIGGER EXCEPTION (elapsed=%.1fms): %s", elapsed_ms, e, exc_info=True)
-            logger.error(f"Fusion webhook error: {e} (elapsed={elapsed_ms:.1f}ms)")
+            api_debug.error("SCENARIO TRIGGER EXCEPTION (elapsed=%.1fms): %s: %s",
+                            elapsed_ms, type(e).__name__, e, exc_info=True)
+            logger.error(f"Fusion webhook error: {type(e).__name__}: {e} "
+                         f"(elapsed={elapsed_ms:.1f}ms)")
             return -1, elapsed_ms

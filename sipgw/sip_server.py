@@ -532,16 +532,20 @@ class SIPServer:
             f"duration={duration:.1f}s"
         )
 
-    def _send_bye(self, call: ActiveCall):
-        """Send a BYE request to end a call from our side."""
+    def _build_bye(self, call: ActiveCall) -> bytes:
+        """Build a BYE request to end a call from our side.
+
+        The Via transport token must match the call's transport (UDP/TCP), not a
+        hardcoded UDP — a TCP peer receiving a UDP Via is malformed signaling.
+        """
         local_ip = self._get_local_ip()
         port = self.config.sip.bind_port
         branch = f"z9hG4bK-sipgw-{random.randint(100000, 999999)}"
-        tag = f"sipgw-bye-{random.randint(100000, 999999)}"
+        transport = (call.protocol_type or "udp").upper()
 
         bye = (
             f"BYE sip:{call.caller_user}@{call.remote_addr[0]}:{call.remote_addr[1]} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {local_ip}:{port};branch={branch}\r\n"
+            f"Via: SIP/2.0/{transport} {local_ip}:{port};branch={branch}\r\n"
             f"From: <sip:sipgw@{local_ip}:{port}>;tag={call.to_tag}\r\n"
             f"To: {call.from_header}\r\n"
             f"Call-ID: {call.call_id}\r\n"
@@ -549,9 +553,12 @@ class SIPServer:
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
+        return bye.encode("utf-8")
 
+    def _send_bye(self, call: ActiveCall):
+        """Send a BYE request to end a call from our side."""
         self._send(
-            bye.encode("utf-8"),
+            self._build_bye(call),
             call.remote_addr,
             call.transport,
             call.protocol_type,
