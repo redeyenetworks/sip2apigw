@@ -15,7 +15,41 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import atexit
+import queue as _queue_mod
+from logging.handlers import QueueHandler, QueueListener
+
 from .config import LoggingConfig
+
+# #6 async logging: QueueListeners perform file writes / rotation / .tgz
+# compression on a background thread so a logging call from the event loop only
+# enqueues. Flushed at interpreter exit.
+_ASYNC_LISTENERS: list = []
+
+
+def _add_async_handler(target_logger: logging.Logger, real_handler: logging.Handler) -> None:
+    """Attach ``real_handler`` to ``target_logger`` via a QueueHandler + a
+    background QueueListener, so the calling thread never blocks on disk I/O or
+    a log rotation. The listener thread does the actual write/rotate/compress.
+    """
+    q = _queue_mod.Queue(-1)
+    listener = QueueListener(q, real_handler, respect_handler_level=True)
+    listener.start()
+    _ASYNC_LISTENERS.append(listener)
+    target_logger.addHandler(QueueHandler(q))
+
+
+def stop_async_logging() -> None:
+    """Flush and stop all async log listeners (idempotent)."""
+    while _ASYNC_LISTENERS:
+        listener = _ASYNC_LISTENERS.pop()
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+
+atexit.register(stop_async_logging)
 
 
 class CompressingTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
@@ -111,7 +145,7 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
         file_handler.setFormatter(formatter)
         # Set timezone-aware suffix
         file_handler.suffix = "%Y-%m-%d"
-        root_logger.addHandler(file_handler)
+        _add_async_handler(root_logger, file_handler)   # #6 off-loop file I/O
     else:
         root_logger.warning(f"Log directory {log_dir} does not exist; file logging disabled")
 
@@ -136,7 +170,7 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
         )
         api_handler.setFormatter(api_formatter)
         api_handler.suffix = "%Y-%m-%d"
-        api_logger.addHandler(api_handler)
+        _add_async_handler(api_logger, api_handler)   # #6 off-loop file I/O
         root_logger.info("API debug logging enabled -> %s", api_log_file)
     elif not config.api_debug_log:
         # Add a NullHandler so logging calls don't warn
@@ -164,7 +198,7 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
         )
         sip_handler.setFormatter(sip_formatter)
         sip_handler.suffix = "%Y-%m-%d"
-        sip_logger.addHandler(sip_handler)
+        _add_async_handler(sip_logger, sip_handler)   # #6 off-loop file I/O
         root_logger.info("SIP debug logging enabled -> %s", sip_log_file)
     elif not config.sip_debug_log:
         sip_logger.addHandler(logging.NullHandler())
