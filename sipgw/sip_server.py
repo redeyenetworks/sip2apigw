@@ -24,6 +24,7 @@ from .sip_message import (
     build_response,
     parse_sdp_connection,
     parse_sdp_media_port,
+    invite_fingerprint,
 )
 from .rtp_handler import RTPSilenceStream
 from .config import AppConfig
@@ -52,6 +53,7 @@ class ActiveCall:
     timeout_task: Optional[asyncio.Task] = None
     transport: object = None
     protocol_type: str = "udp"
+    fingerprint: str = ""          # #15 INVITE transaction fingerprint
     created_at: float = field(default_factory=time.time)
 
 
@@ -308,6 +310,14 @@ class SIPServer:
         """Handle an incoming INVITE — answer the call immediately."""
         call_id = msg.get_call_id()
 
+        # #15 correlation fingerprint (retransmit-stable). Computed before the
+        # re-INVITE early-return so retransmits still get a correlation line,
+        # but on_call is NOT re-invoked (no second page).
+        fingerprint = invite_fingerprint(msg)
+        logger.info(f"INVITE {call_id} fingerprint={fingerprint} from {addr[0]}:{addr[1]}")
+        sip_debug.info("INVITE fingerprint=%s call_id=%s from=%s:%s",
+                       fingerprint, call_id, addr[0], addr[1])
+
         if call_id in self.calls:
             # Re-INVITE on existing call — just re-send 200 OK
             call = self.calls[call_id]
@@ -363,6 +373,7 @@ class SIPServer:
                 caller_display_name=caller_display,
                 transport=transport,
                 protocol_type=protocol_type,
+                fingerprint=fingerprint,
             )
 
             self.calls[call_id] = call
@@ -532,16 +543,20 @@ class SIPServer:
             f"duration={duration:.1f}s"
         )
 
-    def _send_bye(self, call: ActiveCall):
-        """Send a BYE request to end a call from our side."""
+    def _build_bye(self, call: ActiveCall) -> bytes:
+        """Build a BYE request to end a call from our side.
+
+        The Via transport token must match the call's transport (UDP/TCP), not a
+        hardcoded UDP — a TCP peer receiving a UDP Via is malformed signaling.
+        """
         local_ip = self._get_local_ip()
         port = self.config.sip.bind_port
         branch = f"z9hG4bK-sipgw-{random.randint(100000, 999999)}"
-        tag = f"sipgw-bye-{random.randint(100000, 999999)}"
+        transport = (call.protocol_type or "udp").upper()
 
         bye = (
             f"BYE sip:{call.caller_user}@{call.remote_addr[0]}:{call.remote_addr[1]} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {local_ip}:{port};branch={branch}\r\n"
+            f"Via: SIP/2.0/{transport} {local_ip}:{port};branch={branch}\r\n"
             f"From: <sip:sipgw@{local_ip}:{port}>;tag={call.to_tag}\r\n"
             f"To: {call.from_header}\r\n"
             f"Call-ID: {call.call_id}\r\n"
@@ -549,9 +564,12 @@ class SIPServer:
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
+        return bye.encode("utf-8")
 
+    def _send_bye(self, call: ActiveCall):
+        """Send a BYE request to end a call from our side."""
         self._send(
-            bye.encode("utf-8"),
+            self._build_bye(call),
             call.remote_addr,
             call.transport,
             call.protocol_type,

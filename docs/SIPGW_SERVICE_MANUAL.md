@@ -2,14 +2,15 @@
 
 ## SIP-to-Webhook Gateway for Rauland Nurse Call Systems
 
-**Version:** 1.5
-**Last Updated:** 2026-03-24
+**Version:** 1.6.0
+**Last Updated:** 2026-07-01
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
+1a. [v1.6.0 Reliability and Observability](#1a-v160-reliability-and-observability)
 2. [Architecture](#2-architecture)
 3. [Module Reference](#3-module-reference)
 4. [Call Flow](#4-call-flow)
@@ -45,6 +46,117 @@ SIPGW is a Python asyncio service that acts as a bridge between a Rauland nurse 
 - **Fusion Webhook Delivery:** Authenticates to the Informacast Fusion API using OAuth2 client credentials, then triggers a configured scenario with the assembled TTS string as the notification payload.
 - **Web Dashboard:** Provides a dark-themed, auto-refreshing HTML dashboard that displays call history, statistics, application logs, and API debug logs.
 - **Call History:** Persists all processed calls to a SQLite database for historical review and dashboard display.
+- **Durable Record-First Delivery (v1.6.0):** Every page is written to the database in state `pending` *before* any delivery is attempted; a background delivery worker drives it through the state machine `pending → delivering → delivered | failed | expired`, retries with exponential backoff, escalates undeliverable pages to a human channel, and re-queues in-flight pages after a restart. See [Section 1A](#1a-v160-reliability-and-observability).
+- **Decoupled Read-Only Dashboard (v1.6.0):** The dashboard runs as a separate process that opens the database read-only and reports liveness from the writer's heartbeat, so a runaway UI can never affect paging.
+
+---
+
+## 1A. v1.6.0 Reliability and Observability
+
+Version 1.6.0 is a reliability + observability release. The gateway moves from best-effort, single-process paging to a **durable, record-first delivery pipeline** with retry, escalation, background token refresh, a real heartbeat-backed `/health`, a systemd watchdog, and a decoupled read-only dashboard. Every change here preserves the life-safety invariants: no real outbound send in dev/test (`NoSendGuardTransport`), `[TEST]`-marked logs and `is_test=1` rows under dry-run, the prod-DB path barrier on every DB open (including the dashboard's read-only connection), and — above all — **a real page is never dropped, duplicated, suppressed, or gated by any new machinery.**
+
+The numbered items below (#2–#15) are the internal work-item identifiers used throughout the code comments and `CHANGELOG.md`.
+
+### 1A.1 Durable, Record-First Delivery (#2)
+
+`SIPGateway.on_call` (`main.py`) now **records the page first**: it calls `database.create_pending_call()` to insert the row in state `pending` **before** any delivery is attempted. A background `DeliveryWorker` (`delivery.py`) then drives the delivery state machine:
+
+```
+pending → delivering → delivered
+              │  ├──────→ (retry) → pending
+              │  ├──────→ failed     (max_attempts exhausted)
+              │  └──────→ expired    (older than max_age_seconds)
+```
+
+- The database (`database.py`) runs in **WAL mode** with an idempotent schema migration that adds the durable-delivery columns (`state`, `attempts`, `last_error`, `sip_call_id`, `delivered_at`, `is_test`) and a `state` index. Pre-existing rows migrate to state `legacy` with `attempts=0`, `is_test=0`, **without data loss**.
+- State transitions are explicit methods: `create_pending_call`, `mark_attempting`, `mark_delivered`, `reschedule`, `mark_failed`, `mark_expired`, `get_deliverable`.
+- On startup, `DeliveryWorker.recover()` re-queues any rows left in `delivering` by a crash, so **nothing in flight is lost** across restarts.
+
+### 1A.2 Retry with Exponential Backoff (#2)
+
+Failed attempts retry with `delivery.base_backoff_seconds` (default 2.0s) doubling up to `delivery.max_backoff_seconds` (default 60s), honoring an upstream `Retry-After` delta-seconds value when present. After `delivery.max_attempts` attempts (default 6) a page is marked `failed`; a page still undelivered past `delivery.max_age_seconds` (default 900s / 15 min) is marked `expired`. The worker polls every `delivery.poll_interval_seconds` (default 1.0s) in batches of `delivery.batch_size` (default 20).
+
+### 1A.3 Escalation on Failed / Expired Pages (#3)
+
+`escalation.py` posts to a human alert channel (`escalation.webhook_url` — a Teams/Slack/PagerDuty/NOC endpoint) whenever a page ends in `failed` or `expired`. An empty URL disables escalation (failures are still logged at ERROR). In dry-run the escalation HTTP client is built with the `NoSendGuardTransport`, so no real escalation can leave the box in testing.
+
+### 1A.4 Background OAuth2 Token Refresh (#4)
+
+The webhook client (`webhook.py`) refreshes the OAuth2 access token proactively — `fusion.token_refresh_margin_seconds` (default 300s) before expiry — in a background loop (`start_token_refresh` / `_refresh_loop`). This keeps the token warm **off the hot page path**, so a page never blocks on a token round-trip. The 401-refresh-and-retry-once behavior is retained as a backstop.
+
+### 1A.5 Clinical Dedupe in SHADOW / DISABLED (#5)
+
+`dedupe.py` computes a stable **clinical** fingerprint `cf-v1:<hex>` over the normalized `(area, room, bed, purpose)` tuple — deliberately **distinct** from #15's SIP transaction fingerprint. It ships **inert** behind **two OFF switches**:
+
+- `dedupe.enforce = false` — never suppresses a page.
+- `dedupe.window_seconds = 0` — the shadow duplicate lookup never even queries the DB.
+
+Setting `window_seconds > 0` is a **test-only** telemetry mode that logs `WOULD suppress …` when a duplicate is found within the window but **still returns no-suppress** (the page is delivered). `enforce = true` is out-of-policy and made **fatal** by `validate_config` (#9).
+
+**The record-first rule is sacred:** the deduper runs *after* `create_pending_call` and **never gates the insert or delivery**. A real second Code Blue for the same room is **always delivered**. Enforcement is gated on clinical sign-off *and* a real Rauland INVITE capture to validate the fingerprint against production traffic (see [Section 1A.17](#1a17-deferred--gated-on-humans--real-hosts)).
+
+### 1A.6 Async Logging (#6)
+
+`logging_config.py` moves all file writes, daily rotation, and gzip/`.tgz` compression **off the asyncio event loop**. Each real file handler (a `CompressingTimedRotatingFileHandler` on `sipgw.log`, `sipgw_api_debug.log`, and `sipgw_sip_debug.log`) is fronted by a non-blocking `QueueHandler`; a background `QueueListener` thread performs the actual write/rotate/compress. Listeners are flushed and stopped at interpreter exit.
+
+### 1A.7 Real `/health` Backed by a Writer Heartbeat (#7)
+
+The **writer** process stamps a `heartbeat` row (`database.write_heartbeat("writer")`) every `health.heartbeat_interval_seconds` (default 10s), and an initial beat is written before `/health` can be consulted. The dashboard's `/health` endpoint reads that row (`database.read_heartbeat`) and reports:
+
+- `200 {"status": "ok", "heartbeat_age_s": …}` when the heartbeat is fresh,
+- `503 {"status": "stale", …}` when older than `health.stale_after_seconds` (default 30s),
+- `503 {"status": "no-heartbeat"}` when no beat row exists.
+
+This is a single source of truth — the dashboard never invents its own liveness key.
+
+### 1A.8 systemd `Type=notify` Watchdog (#8)
+
+`watchdog.py` implements sd_notify. The writer (`sipgw.service`, `Type=notify`) sends `READY=1` once its listeners are up — **before** `recover()` runs, so a large recovery can never delay READY and trip the restart loop — and then pings `WATCHDOG` on a cadence (roughly `WatchdogSec/2`). A hung event loop is detected by systemd and the pager is restarted. The pinger is **fully inert without real systemd** (containers/CI), where `NOTIFY_SOCKET`/`WATCHDOG_USEC` are absent. `StartLimitIntervalSec=0` keeps start-rate limiting from ever wedging the life-safety pager in `failed`.
+
+### 1A.9 Startup Config Validation (#9)
+
+`config.validate_config(config, dry_run)` fails **fatally** on invalid production config and warns on soft issues. In production (dry-run off) it requires the Fusion credentials and scenario id, and rejects e.g. `delivery.max_attempts < 1`, `poll_interval_seconds <= 0`, and — critically — `dedupe.enforce = true`. It warns (non-fatal) on soft issues such as an empty `escalation.webhook_url`.
+
+### 1A.10 State-Aware, Test-Excluding Stats (#10)
+
+Dashboard statistics derive from the delivery **state machine** and **exclude `is_test=1` rows**, so dry-run/test traffic never inflates the real counts. A **Pending** card was added alongside Successful and Failed.
+
+### 1A.11 Logging Hygiene (#11)
+
+Includes correct BYE Via/transport handling, masking of both the OAuth2 client id **and** secret (in addition to bearer tokens), and logging exception **types** rather than swallowing them.
+
+### 1A.12 Canonical UTC RFC3339-Z Timestamps (#12)
+
+The writer stamps atomic UTC `…Z` timestamps (`database._utc_rfc3339`). Day-boundary bucketing (e.g. "today's calls") keys off the numeric `created_at` epoch via `_day_start_epoch`, and the dashboard renders **host-local** wall-clock time under a "Time (local)" column via `display_local`. `logging.timezone = ""` means host-local (hosts run UTC); an IANA name overrides both display and rotation.
+
+### 1A.13 Stable INVITE Fingerprint (#15)
+
+`sip_message.invite_fingerprint(msg)` yields a stable `v1:<hex>` SIP **transaction** identity (derived from Call-ID / From / CSeq) for correlation and as the technical basis for #5. It is kept clearly separate from #5's `cf-v1:` **clinical** identity: the two answer different questions (same SIP transaction vs. same clinical event).
+
+### 1A.14 Two-Service Split: Writer + Read-Only Dashboard (#14)
+
+The dashboard is now a **separate process** (`dashboard_app.py`, unit `sipgw-dashboard.service`) from the life-safety writer (`sipgw.main`, unit `sipgw.service`):
+
+- The dashboard opens the shared SQLite DB **read-only** (`PRAGMA query_only=ON`, not `mode=ro`, so the `-wal`/`-shm` sidecars can still build while logical writes are blocked). It only ever reads — the writer owns every write, including the heartbeat that `/health` consumes.
+- The prod-DB path barrier (`assert_safe_database_path`) runs on this read-only open too.
+- The sd_notify watchdog stays **exclusively** on the writer. The dashboard is a plain `Type=simple` HTTP server.
+- The dashboard runs under its own `MemoryMax=256M` / `CPUQuota=50%` envelope so a runaway UI request cannot starve the writer. (These enforce **only** under real systemd with cgroup controllers; they are inert in CI/containers.)
+
+### 1A.15 Dashboard View Toggle + CSV Export (#13-P1)
+
+A **Summary / Advanced** view toggle (invalid `view` values fall back to `summary`, never a 500) and an `/export.csv` endpoint that streams **today's real calls** (the export query enforces `AND is_test=0`, so no dry-run/test row can leak; rows are quoted by the stdlib `csv` module).
+
+### 1A.16 Dry-Run Safety Model
+
+Effective dry-run = `config.dry_run` **OR** environment `SIPGW_DRY_RUN=1` (`safety.effective_dry_run`). Per the runbook, the environment may only **enable** dry-run, **never disable** it. When dry-run is active, every outbound HTTP client (Fusion webhook, escalation) is built with `NoSendGuardTransport`, which refuses real sends and returns a synthetic response; every log line is `[TEST]`-marked and every DB row is `is_test=1`.
+
+### 1A.17 Deferred / Gated on Humans + Real Hosts
+
+The following are shipped in code but **not yet exercised or approved for production**:
+
+- **Real-systemd watchdog + OOM isolation drills** — the `Type=notify` watchdog (#8) and the dashboard `MemoryMax`/`CPUQuota` envelope (#14) are inert in CI/containers and must be exercised under real systemd with cgroup controllers before cutover.
+- **#5 dedupe enforcement** stays SHADOW/DISABLED until **clinical sign-off** *and* a **real Rauland INVITE capture** validate the clinical fingerprint against production traffic. Suppression (`dedupe.enforce=true`) is `validate_config`-forbidden today.
+- **Production cutover** of the two-service split remains a manual, operator-run step.
 
 ---
 
@@ -208,7 +320,7 @@ Contains two key functions for constructing the final TTS announcement:
 Manages authentication and API communication with the Informacast Fusion platform:
 
 - **OAuth2 Client Credentials Flow:** Acquires access tokens from the Fusion token endpoint using client ID, client secret, and audience (provider ID).
-- **Token Caching:** Tokens are cached in memory and reused until they are within 60 seconds of expiration, at which point a new token is automatically acquired.
+- **Token Caching + Background Refresh:** Tokens are cached in memory. As of v1.6.0 (#4) a background loop refreshes the token `fusion.token_refresh_margin_seconds` (default 300s) before expiry so a page never blocks on a token round-trip; the 60-second on-demand refresh and 401-retry remain as backstops.
 - **Automatic Retry on 401:** If a scenario trigger request receives a 401 Unauthorized response, the client automatically refreshes the token and retries the request once.
 - **Scenario Triggering:** Sends a POST request to the scenario notifications endpoint with the assembled TTS string as the field answer.
 - **Field ID Auto-Resolution:** If `scenario_field_id` is left empty in the configuration, the client automatically resolves it by querying the scenario definition from the Fusion API on the first call.
@@ -221,6 +333,7 @@ Provides asynchronous SQLite database access using the `aiosqlite` library:
 - **Call History Storage:** Records every processed call with details including timestamp, caller information, parsed area/room, generated TTS string, Fusion API response status, and response time.
 - **Query Interface:** Provides methods for the dashboard to retrieve call history with optional filtering and pagination.
 - **Schema Management:** Automatically creates the required tables on first run.
+- **v1.6.0 additions:** Runs in **WAL mode**; implements the durable delivery state machine (`create_pending_call`, `mark_attempting`, `mark_delivered`, `reschedule`, `mark_failed`, `mark_expired`, `get_deliverable`) with an idempotent migration; the `heartbeat` table (`write_heartbeat`/`read_heartbeat`, #7); canonical UTC RFC3339-Z timestamps (`_utc_rfc3339`, `_day_start_epoch`, `display_local`, #12); a read-only mode (`query_only=ON`) for the dashboard (#14); and the prod-DB path barrier on every open.
 
 ### 3.10 dashboard.py -- Web Dashboard
 
@@ -242,6 +355,7 @@ Configures the application logging infrastructure:
 - **Daily Rotation:** Log files rotate at midnight (configurable) in the configured timezone. Rotated files are compressed into `.tgz` archives.
 - **Retention:** Old log files are retained for the configured number of days (default 90), after which they are automatically deleted.
 - **API Debug Log:** When enabled, a separate log file at `/var/log/sipgw/sipgw_api_debug.log` captures detailed HTTP request/response information for northbound API calls to Fusion.
+- **Async, non-blocking (v1.6.0, #6):** Each real file handler (`CompressingTimedRotatingFileHandler` on `sipgw.log`, `sipgw_api_debug.log`, `sipgw_sip_debug.log`) is fronted by a `QueueHandler`; a background `QueueListener` thread performs the write/rotate/compress so the event loop never blocks on disk I/O. The dashboard process attaches its own handlers to `sipgw_dashboard.log`.
 
 ### 3.12 config.py -- Configuration Loader
 
@@ -249,13 +363,49 @@ Loads and validates the application configuration:
 
 - **Typed Dataclass:** Configuration is represented as a Python dataclass with typed fields, providing IDE auto-completion and runtime type checking.
 - **YAML Source:** Configuration is loaded from `config.yaml` (path configurable via environment variable).
-- **Validation:** Required fields are checked at load time, and invalid values produce clear error messages.
+- **Validation:** Required fields are checked at load time. `validate_config(config, dry_run)` (#9) returns a list of warnings and raises `ConfigError` on fatal problems in production (missing Fusion credentials/scenario id, `delivery.max_attempts < 1`, `poll_interval_seconds <= 0`, `dedupe.enforce = true`).
+- **v1.6.0 dataclasses:** Adds `DeliveryConfig`, `EscalationConfig`, `HealthConfig`, and `DedupeConfig`, plus `fusion.dry_run` and `fusion.token_refresh_margin_seconds`.
+
+### 3.13 safety.py -- Life-Safety Guards (v1.6.0)
+
+The centralized safety layer. **Must remain intact.**
+
+- **`effective_dry_run(config_dry_run)`** -- Dry-run is active when the config flag enables it **or** env `SIPGW_DRY_RUN == "1"`. The environment can only **enable** dry-run, never disable it.
+- **`NoSendGuardTransport`** -- an `httpx.AsyncBaseTransport` that refuses any real outbound request in dry-run and returns a synthetic response. Every dry-run HTTP client (Fusion webhook, escalation) uses it.
+- **`assert_safe_database_path(db_path, dry_run)`** -- the prod-DB path barrier; runs on **every** DB open, including the dashboard's read-only connection.
+- **`TestMarkerFilter` / `install_test_marker`** -- ensures every log line is `[TEST]`-marked in testing.
+
+### 3.14 delivery.py -- Delivery Worker (#2, v1.6.0)
+
+The background `DeliveryWorker` that drives the durable delivery state machine (`pending → delivering → delivered | failed | expired`), applies exponential backoff with `Retry-After` support, escalates on `failed`/`expired` via the injected `on_escalate` callback, and recovers crash-orphaned `delivering` rows on startup (`recover()`).
+
+### 3.15 escalation.py -- Human Escalation (#3, v1.6.0)
+
+The `Escalator` posts to `escalation.webhook_url` when a page ends `failed` or `expired`. In dry-run its client carries the `NoSendGuardTransport`.
+
+### 3.16 dedupe.py -- Clinical Dedupe SHADOW/DISABLED (#5, v1.6.0)
+
+Computes the clinical fingerprint `cf-v1:<hex>` and, in shadow mode only, logs `WOULD suppress …` telemetry. Ships inert (`enforce=false`, `window_seconds=0`) and **never gates the insert or delivery**. See [Section 1A.5](#1a5-clinical-dedupe-in-shadow--disabled-5).
+
+### 3.17 watchdog.py -- systemd sd_notify Watchdog (#8, v1.6.0)
+
+Implements `notify_ready`, `notify_watchdog`, `notify_stopping`, and the `WatchdogPinger` that pings systemd on a cadence. Fully inert without a real `NOTIFY_SOCKET`.
+
+### 3.18 dashboard_app.py -- Read-Only Dashboard Process (#14, v1.6.0)
+
+The separate dashboard entry point. Opens the DB read-only (`query_only=ON`), builds the FastAPI app from `dashboard.py`, and serves it. Runs under `sipgw-dashboard.service`. The writer keeps writing the heartbeat; this process only reads it for `/health`.
+
+### 3.19 sip_message.py additions -- INVITE Fingerprint (#15, v1.6.0)
+
+`invite_fingerprint(msg)` returns a stable `v1:<hex>` SIP transaction identity (Call-ID / From / CSeq) for correlation, distinct from #5's clinical `cf-v1:` identity.
 
 ---
 
 ## 4. Call Flow
 
 The following describes the complete lifecycle of a single nurse call alert, from SIP signaling through Fusion notification delivery.
+
+> **v1.6.0 record-first change:** As of v1.6.0 the pipeline is **record-first**. After parsing and building the TTS string (Steps 6–8), `on_call` immediately inserts the page into the database in state `pending` (`create_pending_call`) — this insert is never gated by dedupe or any downstream check. The clinical deduper (#5) runs *after* the insert as pure telemetry. The actual Fusion delivery (Steps 9–12: token acquisition, scenario trigger, retries, and the final state transition to `delivered`/`failed`/`expired`) is then performed **asynchronously** by the background `DeliveryWorker`, not inline on the SIP path. Failed/expired pages are escalated to a human channel (#3). See [Section 1A.1](#1a1-durable-record-first-delivery-2).
 
 ### Step 1: SIP INVITE Received
 
@@ -406,6 +556,34 @@ fusion:
   scenario_field_id: "field-uuid"        # Field UUID (auto-resolved if left empty)
   client_id: "your-client-id"            # OAuth2 client ID
   client_secret: "your-client-secret"    # OAuth2 client secret
+  dry_run: false                         # v1.6.0: true = never send real requests (env SIPGW_DRY_RUN=1 also enables)
+  token_refresh_margin_seconds: 300      # v1.6.0 (#4): refresh the token this many seconds before expiry
+
+# v1.6.0 (#2) durable-delivery retry worker tuning
+delivery:
+  max_attempts: 6                        # attempts before a page is marked 'failed' + escalated
+  base_backoff_seconds: 2.0              # first retry delay; doubles each attempt
+  max_backoff_seconds: 60.0             # backoff ceiling
+  max_age_seconds: 900.0                # undelivered longer than this -> 'expired' + escalate
+  poll_interval_seconds: 1.0            # worker poll cadence
+  batch_size: 20                        # rows pulled per poll
+
+# v1.6.0 (#3) human escalation on failed/expired pages
+escalation:
+  webhook_url: ""                        # Teams/Slack/PagerDuty/NOC endpoint; empty disables (still logs ERROR)
+  timeout_seconds: 10.0
+
+# v1.6.0 (#7) liveness heartbeat + /health staleness
+health:
+  heartbeat_interval_seconds: 10.0       # writer stamps the heartbeat row this often
+  stale_after_seconds: 30.0              # /health reports 503 if the beat is older than this
+
+# v1.6.0 (#5) clinical dedupe — ships SHADOW/DISABLED. DO NOT enable enforce.
+dedupe:
+  enforce: false                         # MUST be false (validate_config makes true fatal) — never suppresses
+  window_seconds: 0                      # 0 = shadow lookup never runs; >0 is test-only 'WOULD suppress' telemetry
+  match_bed: true
+  match_purpose: true
 
 tts:
   play_count: 3                          # Number of times the TTS base message repeats
@@ -921,7 +1099,7 @@ The main view displays a table of all processed calls with the following columns
 
 | Column | Description |
 |--------|-------------|
-| Timestamp | Date and time the call was received |
+| Time (local) | Time the call was received, rendered in **host-local** wall-clock (v1.6.0, #12). The stored value is canonical UTC RFC3339-Z (`_utc_rfc3339`); `display_local` converts it for display. |
 | Caller | Raw SIP From header information |
 | Area | Resolved area name from the lookup table |
 | Room | Resolved room name/number |
@@ -933,11 +1111,17 @@ The table is sorted by timestamp in descending order, with the most recent calls
 
 #### Statistics Cards
 
-Three summary cards are displayed above the call table:
+Summary cards are displayed above the call table. As of v1.6.0 (#10) these are **state-aware** (derived from the delivery state machine) and **exclude `is_test=1` rows**, so dry-run/test traffic never inflates the counts:
 
-- **Total Calls:** Count of all calls processed since the database was created.
-- **Successful Calls:** Count of calls where the Fusion API returned a successful response.
-- **Failed Calls:** Count of calls where the Fusion API returned an error or the request failed.
+- **Total Calls:** Count of real calls (today).
+- **Successful Calls:** Count of pages in state `delivered`.
+- **Failed Calls:** Count of pages in state `failed`/`expired`.
+- **Pending Calls:** Count of pages still awaiting/attempting delivery (state `pending`/`delivering`) — added in v1.6.0.
+
+#### View Toggle and CSV Export (v1.6.0, #13-P1)
+
+- **Summary / Advanced view toggle** — switches the call table between a compact summary and an advanced view that includes the delivery `state` column. Invalid `view` values fall back to `summary` (never a 500).
+- **Export CSV** — the `/export.csv` link streams **today's real calls** (`is_test=0` enforced in the query) as a downloadable `sipgw-calls-<date>.csv`.
 
 #### Recent Logs Panel
 
@@ -981,15 +1165,15 @@ Returns call history as a JSON array.
 
 #### GET /health
 
-Returns a simple health check response.
+Returns liveness derived from the writer's heartbeat row (v1.6.0, #7). The dashboard process reads the beat the **writer** stamps and compares its age to `health.stale_after_seconds` (default 30s):
 
-**Example Response:**
+| Condition | HTTP status | Body |
+|-----------|-------------|------|
+| Heartbeat fresh | `200` | `{"status": "ok", "heartbeat_age_s": 4.2}` |
+| Heartbeat stale (older than `stale_after_seconds`) | `503` | `{"status": "stale", "heartbeat_age_s": 61.0}` |
+| No heartbeat row yet | `503` | `{"status": "no-heartbeat"}` |
 
-```json
-{
-  "status": "healthy"
-}
-```
+Because the writer and dashboard are separate processes (#14), a `503` from `/health` on a running dashboard indicates the **writer** is unhealthy or stopped — not the dashboard.
 
 ---
 
@@ -1104,8 +1288,8 @@ The installation script performs the following:
 - Creates the data directory at `/var/lib/sipgw/` with ownership set to the `sipgw` user.
 - Creates a Python virtual environment at `/opt/sipgw/venv/`.
 - Installs Python dependencies from `/opt/sipgw/requirements.txt` into the virtual environment.
-- Installs the systemd service unit file from `/opt/sipgw/sipgw.service`.
-- Enables the service for automatic start on boot.
+- Installs **both** systemd unit files: `/opt/sipgw/sipgw.service` (the life-safety writer) and `/opt/sipgw/sipgw-dashboard.service` (the read-only dashboard, v1.6.0 #14).
+- Enables both services for automatic start on boot.
 - Grants the `CAP_NET_BIND_SERVICE` capability to the Python interpreter so the service can bind to port 5060 without running as root.
 
 3. Configure the service:
@@ -1129,16 +1313,18 @@ sudo nano /opt/sipgw/lookups.yaml
 
 Populate the `areas`, `call_purposes`, and `rooms` tables with values appropriate for your facility.
 
-5. Start the service:
+5. Start both services:
 
 ```bash
 sudo systemctl start sipgw
+sudo systemctl start sipgw-dashboard
 ```
 
-6. Verify the service is running:
+6. Verify both services are running:
 
 ```bash
 systemctl status sipgw
+systemctl status sipgw-dashboard
 ```
 
 7. Open the dashboard in a browser:
@@ -1151,7 +1337,14 @@ http://<hostname>:8080
 
 ## 15. Service Management
 
-SIPGW runs as a systemd service named `sipgw`.
+As of v1.6.0 (#14) SIPGW runs as **two** systemd services:
+
+| Unit | Process | Role |
+|------|---------|------|
+| `sipgw.service` | `sipgw.main` | The life-safety **writer**: SIP server, delivery worker, escalation, token refresh, heartbeat writer. `Type=notify` with a 30s watchdog (#8); `StartLimitIntervalSec=0` so start-rate limiting never wedges the pager in `failed`. |
+| `sipgw-dashboard.service` | `sipgw.dashboard_app` | The **read-only dashboard** + `/health` (#14). Opens the DB read-only (`query_only=ON`); `Type=simple` (no watchdog). Runs under `MemoryMax=256M` / `CPUQuota=50%` (enforced only under real systemd cgroups). |
+
+The dashboard can be restarted independently without affecting paging. The watchdog and the sd_notify machinery live **only** on `sipgw.service`.
 
 ### 15.1 Common Commands
 
@@ -1182,16 +1375,25 @@ tail -f /var/log/sipgw/sipgw.log
 
 # Follow the API debug log file
 tail -f /var/log/sipgw/sipgw_api_debug.log
+
+# Dashboard process (v1.6.0 #14) — manage independently of the writer
+sudo systemctl restart sipgw-dashboard
+systemctl status sipgw-dashboard
+journalctl -u sipgw-dashboard -f
+tail -f /var/log/sipgw/sipgw_dashboard.log
 ```
 
 ### 15.2 When to Restart
 
-The service must be restarted after any of the following changes:
+The **writer** (`sipgw.service`) must be restarted after any of the following changes:
 
 - Modifications to `config.yaml`.
-- Modifications to `lookups.yaml` (lookup tables are cached at startup).
 - Python code changes.
-- To clear a stale cached OAuth2 token.
+
+Notes:
+- **`lookups.yaml` no longer requires a restart** — changes are hot-reloaded on the next lookup (v1.5). See [Section 6](#6-lookup-tables-reference).
+- A stale OAuth2 token no longer generally requires a restart — the token is refreshed proactively in the background (v1.6.0, #4) and on a 401.
+- Restart `sipgw-dashboard.service` for dashboard-only config (view/port) changes; it does not affect paging.
 
 ### 15.3 Dashboard Access
 
@@ -1512,23 +1714,30 @@ sudo userdel sipgw
 ├── config.yaml           # Main service configuration
 ├── lookups.yaml          # Area, purpose, and room lookup tables
 ├── requirements.txt      # Python package dependencies
-├── sipgw.service         # systemd unit file
+├── sipgw.service         # systemd unit file — writer (Type=notify watchdog)
+├── sipgw-dashboard.service # systemd unit file — read-only dashboard (v1.6.0 #14)
 ├── install.sh            # Installation script
 ├── uninstall.sh          # Uninstallation script
 ├── sipgw/                # Python package (application code)
 │   ├── __init__.py       # Package initialization
-│   ├── config.py         # Typed dataclass configuration loader
-│   ├── main.py           # Entry point and SIPGateway orchestrator class
+│   ├── config.py         # Typed dataclass config loader + validate_config (#9)
+│   ├── main.py           # Writer entry point + SIPGateway orchestrator (record-first)
+│   ├── dashboard_app.py  # Read-only dashboard entry point (v1.6.0 #14)
 │   ├── sip_server.py     # Asyncio SIP server (UDP + TCP, IP filtering)
-│   ├── sip_message.py    # SIP message parser and response builder
+│   ├── sip_message.py    # SIP message parser/builder + invite_fingerprint (#15)
 │   ├── rtp_handler.py    # RTP silence stream sender (PCMU/8000)
 │   ├── parser.py         # SIP From header parser (area/room/bed extraction)
 │   ├── lookups.py        # Lookup table loader and cache
 │   ├── tts_builder.py    # TTS string builder and assembler
-│   ├── webhook.py        # Fusion API client (OAuth2 + scenario triggering)
-│   ├── database.py       # SQLite database interface (aiosqlite)
-│   ├── dashboard.py      # FastAPI web dashboard
-│   └── logging_config.py # Logging configuration (dual output, rotation)
+│   ├── webhook.py        # Fusion API client (OAuth2 + background token refresh #4)
+│   ├── database.py       # SQLite (aiosqlite, WAL) — state machine + heartbeat + UTC ts
+│   ├── delivery.py       # Durable delivery worker + retry/backoff (#2)
+│   ├── escalation.py     # Human escalation on failed/expired (#3)
+│   ├── dedupe.py         # Clinical dedupe SHADOW/DISABLED (#5)
+│   ├── watchdog.py       # systemd sd_notify watchdog (#8)
+│   ├── safety.py         # Life-safety guards: no-send, prod-DB barrier, test marker
+│   ├── dashboard.py      # FastAPI web dashboard (view toggle + CSV, state-aware stats)
+│   └── logging_config.py # Async logging (QueueHandler) + rotation/compression (#6)
 ├── tests/                # Test suite (105 tests across 9 files)
 │   ├── test_parser.py
 │   ├── test_lookups.py
@@ -1544,8 +1753,10 @@ sudo userdel sipgw
 └── venv/                 # Python virtual environment
 
 /var/log/sipgw/
-├── sipgw.log             # Main application log (daily rotation, .tgz compression)
-└── sipgw_api_debug.log   # Detailed northbound API debug log
+├── sipgw.log             # Main writer application log (daily rotation, .tgz compression)
+├── sipgw_api_debug.log   # Detailed northbound API debug log
+├── sipgw_sip_debug.log   # SIP-layer debug log
+└── sipgw_dashboard.log   # Dashboard process log (v1.6.0 #14)
 
 /var/lib/sipgw/
 └── calls.db              # SQLite call history database

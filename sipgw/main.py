@@ -1,6 +1,9 @@
-"""Main entry point for sipgw — SIP-to-Webhook Gateway.
+"""Main entry point for sipgw — SIP-to-Webhook Gateway (writer process).
 
-Wires together all components and runs the SIP server + dashboard concurrently.
+Wires together the SIP server + delivery worker + heartbeat + watchdog. As of
+#14 (two-service split) the dashboard runs in its OWN process
+(``python -m sipgw.dashboard_app``); this process no longer serves HTTP. It
+KEEPS writing the heartbeat row, which the decoupled dashboard reads for /health.
 """
 
 import asyncio
@@ -8,7 +11,6 @@ import logging
 import signal
 import sys
 import os
-import uvicorn
 
 from .config import load_config, AppConfig
 from .lookups import load_lookups
@@ -18,7 +20,11 @@ from .webhook import FusionWebhook
 from .parser import parse_caller
 from .tts_builder import build_tts, assemble_tts
 from .sip_server import SIPServer
-from .dashboard import create_dashboard
+from .delivery import DeliveryWorker
+from .escalation import Escalator
+from .dedupe import Deduper
+from .watchdog import notify_ready, notify_stopping, WatchdogPinger
+from .safety import effective_dry_run
 
 logger = logging.getLogger("sipgw.main")
 
@@ -28,11 +34,36 @@ class SIPGateway:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.db = CallDatabase(config.database.path)
+        self._dry_run = effective_dry_run(config.fusion.dry_run)
+        # dry_run feeds the prod-DB barrier, which runs on every DB open.
+        self.db = CallDatabase(config.database.path, timezone=config.logging.timezone,
+                               dry_run=self._dry_run)
         self.webhook = FusionWebhook(config.fusion)
+        # #3 escalation, shares the no-send guard in dry-run.
+        self.escalator = Escalator(config.escalation, dry_run=self._dry_run)
+        # #2 durable delivery escalates via the Escalator on failed/expired.
+        self.worker = DeliveryWorker(self.db, self.webhook, config.delivery,
+                                     on_escalate=self.escalator.escalate)
+        # #5 clinical dedupe — SHADOW/DISABLED. Constructed once; used AFTER the
+        # record-first insert as pure telemetry. It never gates delivery.
+        self.deduper = Deduper(config.dedupe)
         self.sip_server = SIPServer(config=config, on_call=self.on_call)
-        self.dashboard = create_dashboard(self.db, config.dashboard, config.logging)
+        # #14: the dashboard now runs as a separate process (sipgw.dashboard_app);
+        # this writer process no longer serves HTTP.
+        self._hb_task = None           # #7 heartbeat writer
+        self.watchdog = WatchdogPinger()   # #8 systemd watchdog (inert w/o systemd)
         self._shutdown_event = asyncio.Event()
+
+    async def _heartbeat_loop(self):
+        interval = self.config.health.heartbeat_interval_seconds
+        while True:
+            try:
+                await self.db.write_heartbeat("writer")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("heartbeat write failed")
+            await asyncio.sleep(interval)
 
     async def on_call(
         self,
@@ -43,15 +74,13 @@ class SIPGateway:
     ):
         """Callback invoked when a SIP call is answered.
 
-        Parses caller info, builds TTS string, triggers webhook, records to DB.
+        Record-first: parse the caller, build the TTS, and persist the page as a
+        PENDING row. The delivery worker sends it (with retries) asynchronously.
+        This is what makes a Code Blue durable across a Fusion outage or a crash
+        between answering the call and delivering the page.
         """
-        # Parse caller info
         caller = parse_caller(from_header)
-
-        # Build TTS string
         tts = build_tts(caller)
-
-        # Assemble with preambles and repetition
         tts = assemble_tts(
             tts,
             play_count=self.config.tts.play_count,
@@ -59,56 +88,77 @@ class SIPGateway:
             iteration_preamble=self.config.tts.iteration_preamble,
         )
 
-        # Trigger Fusion webhook
-        status_code, response_time = await self.webhook.trigger_scenario(tts)
-
-        # Record to database
         area_name = ""
         if caller.area_number is not None:
             from .lookups import get_area_name
             area_name = get_area_name(caller.area_number)
 
-        await self.db.record_call(
+        row_id = await self.db.create_pending_call(
             caller_id=caller.raw_user,
             display_name=caller.display_name,
             area_number=caller.area_number,
             area_name=area_name,
             room_number=caller.room_number,
             tts_string=tts,
-            fusion_status=status_code,
-            response_time_ms=response_time,
+            sip_call_id=call_id,
+            is_test=1 if self._dry_run else 0,
         )
 
-        logger.info(
-            f"Call {call_id} processed: tts='{tts}' "
-            f"fusion_status={status_code} response_time={response_time:.1f}ms"
-        )
+        # #5 clinical dedupe — SHADOW/DISABLED. Runs AFTER the record-first
+        # insert (record-first is sacred; the insert is never gated). This is
+        # NON-suppressing telemetry: it may annotate duplicate_of and log, but
+        # it NEVER skips or delays delivery — the worker still delivers this
+        # pending row, so a real second Code Blue for the same room is sent.
+        try:
+            from .lookups import get_call_purpose
+            decision = await self.deduper.evaluate(
+                self.db,
+                caller=caller,
+                purpose=get_call_purpose(caller.display_name),
+                row_id=row_id,
+                is_test=1 if self._dry_run else 0,
+            )
+            if decision.duplicate_of is not None:
+                await self.db.record_duplicate_of(row_id, decision.duplicate_of)
+                logger.info(
+                    "Call %s (row %s) is a clinical duplicate of row %s "
+                    "(fp=%s) — delivering anyway (SHADOW)",
+                    call_id, row_id, decision.duplicate_of, decision.fingerprint)
+        except Exception:
+            logger.exception(
+                "dedupe evaluate failed for row %s — delivering anyway", row_id)
+
+        logger.info(f"Call {call_id} recorded PENDING (row {row_id}): tts='{tts}'")
 
     async def run(self):
         """Start all services and run until shutdown."""
         # Initialize components
         await self.db.initialize()
         await self.webhook.initialize()
+        await self.escalator.initialize()          # #3 escalation client
+        await self.webhook.start_token_refresh()   # #4 keep the token warm
 
-        logger.info("sipgw gateway starting")
-
-        # Run SIP server and dashboard concurrently
+        # Start the SIP listener FIRST so pages can be received. The dashboard
+        # runs in its own process now (#14); it reads the heartbeat for /health.
         sip_task = asyncio.create_task(self.sip_server.start())
 
-        # Run uvicorn in the same event loop
-        uvicorn_config = uvicorn.Config(
-            app=self.dashboard,
-            host=self.config.dashboard.bind_ip,
-            port=self.config.dashboard.port,
-            log_level="warning",
-            access_log=False,
-        )
-        uvicorn_server = uvicorn.Server(uvicorn_config)
-        dashboard_task = asyncio.create_task(uvicorn_server.serve())
+        # #7 stamp an initial heartbeat before /health is consulted.
+        await self.db.write_heartbeat("writer")
+        self._hb_task = asyncio.create_task(self._heartbeat_loop())
 
-        logger.info(
-            f"Dashboard running on http://{self.config.dashboard.bind_ip}:{self.config.dashboard.port}"
-        )
+        # #8 tell systemd we are up and start watchdog pings BEFORE recovery.
+        # A large recover() must not delay READY (watchdog restart loop); the
+        # pinger then proves event-loop liveness independently of recovery.
+        notify_ready()
+        await self.watchdog.start()
+
+        # #2 durable delivery: recover crash-orphaned rows, then start the worker.
+        recovered = await self.worker.recover()
+        if recovered:
+            logger.info(f"Recovered {recovered} in-flight page(s) for redelivery")
+        await self.worker.start()
+
+        logger.info("sipgw gateway starting")
 
         # Wait for shutdown signal
         try:
@@ -117,13 +167,22 @@ class SIPGateway:
             pass
         finally:
             logger.info("Shutting down sipgw...")
+            notify_stopping()             # #8 tell systemd we're stopping
+            await self.watchdog.stop()
             await self.sip_server.stop()
-            uvicorn_server.should_exit = True
+            await self.worker.stop()      # stop delivery loop (pending rows persist)
+            if self._hb_task:
+                self._hb_task.cancel()
+                try:
+                    await self._hb_task
+                except asyncio.CancelledError:
+                    pass
             await self.webhook.close()
+            await self.escalator.close()
             await self.db.close()
 
             # Give tasks a moment to finish
-            for task in [sip_task, dashboard_task]:
+            for task in [sip_task]:
                 task.cancel()
                 try:
                     await asyncio.wait_for(task, timeout=5)
@@ -142,8 +201,30 @@ def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
     config = load_config(config_path)
 
-    # Setup logging
-    setup_logging(config.logging)
+    # --- §2 safety gates: dry-run marker + hard production-DB barrier ---
+    from .safety import (
+        effective_dry_run, assert_safe_database_path, DRY_RUN_BANNER,
+    )
+    dry_run = effective_dry_run(config.fusion.dry_run)
+
+    # Configure logging with the [TEST] marker installed FIRST when in dry-run,
+    # so every line (including logging's own init lines) is marked.
+    setup_logging(config.logging, dry_run=dry_run)
+    if dry_run:
+        logger.critical(DRY_RUN_BANNER)
+
+    # Refuse to start if dry-run/test mode would write to the production DB.
+    assert_safe_database_path(config.database.path, dry_run)
+
+    # #9 Validate configuration; refuse to start on fatal problems so a
+    # misconfigured prod cannot silently fail on the first Code Blue.
+    from .config import validate_config, ConfigError
+    try:
+        for w in validate_config(config, dry_run):
+            logger.warning("config: %s", w)
+    except ConfigError as e:
+        logger.critical(str(e))
+        raise SystemExit(2)
 
     # Load lookup tables
     lookups_path = os.environ.get("SIPGW_LOOKUPS", "/opt/sipgw/lookups.yaml")
@@ -151,7 +232,7 @@ def main():
 
     logger.info(f"Configuration loaded from {config_path or 'default path'}")
     logger.info(f"SIP bind: {config.sip.bind_ip}:{config.sip.bind_port}")
-    logger.info(f"Dashboard port: {config.dashboard.port}")
+    logger.info("Dashboard runs as a separate process (sipgw.dashboard_app)")
     logger.info(f"Fusion scenario: {config.fusion.scenario_id}")
     logger.info(f"Call timeout: {config.sip.call_timeout_seconds}s")
 

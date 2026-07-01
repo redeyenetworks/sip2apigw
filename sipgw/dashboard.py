@@ -5,14 +5,17 @@ log viewers, and health endpoint. No authentication required.
 """
 
 import os
+import csv
+import io
+import time
 import logging
 import yaml
 from pathlib import Path
 from fastapi import FastAPI, Request, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, StreamingResponse
 from typing import Optional
 
-from .database import CallDatabase
+from .database import CallDatabase, display_local
 from .config import DashboardConfig, LoggingConfig
 
 logger = logging.getLogger("sipgw.dashboard")
@@ -55,6 +58,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             padding: 3px 6px;
             font-size: 0.8rem;
         }
+        .view-toggle {
+            background: #16213e;
+            color: #4fc3f7;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            padding: 3px 8px;
+            text-decoration: none;
+        }
+        .view-toggle:hover { background: #0f3460; color: #fff; }
         .refresh-indicator {
             color: #4caf50;
             font-size: 0.75rem;
@@ -165,6 +177,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             &bull; Page {{ page }} of {{ total_pages }}
         </div>
         <div class="controls">
+            <a class="view-toggle" href="?view={% if view == 'advanced' %}summary{% else %}advanced{% endif %}&amp;page={{ page }}&amp;auto={{ '1' if auto_refresh else '0' }}&amp;refresh={{ refresh_seconds }}">{% if view == 'advanced' %}Summary view{% else %}Advanced view{% endif %}</a>
+            <a class="view-toggle" href="/export.csv">Export CSV</a>
             <label>
                 <input type="checkbox" id="autoRefresh" {% if auto_refresh %}checked{% endif %}>
                 Auto-refresh
@@ -193,6 +207,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="label">Failed</div>
             <div class="value" style="color: #f44336;">{{ failed_calls }}</div>
         </div>
+        <div class="stat-card">
+            <div class="label">Pending</div>
+            <div class="value" style="color: #ff9800;">{{ pending_calls }}</div>
+        </div>
     </div>
 
     <div style="margin-bottom: 15px;">
@@ -204,7 +222,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <table>
         <thead>
             <tr>
-                <th>Timestamp</th>
+                <th>Time (local)</th>
                 <th>Caller ID</th>
                 <th>Display Name</th>
                 <th>Area</th>
@@ -212,13 +230,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <th class="tts-col">TTS String</th>
                 <th>Fusion Status</th>
                 <th>Response Time</th>
+                {% if view == 'advanced' %}
+                <th>Attempts</th>
+                <th>Last Error</th>
+                <th>State</th>
+                {% endif %}
             </tr>
         </thead>
         <tbody>
             {% if calls %}
                 {% for call in calls %}
                 <tr>
-                    <td>{{ call.timestamp }}</td>
+                    <td>{{ call.display_time }}</td>
                     <td>{{ call.caller_id }}</td>
                     <td>{{ call.display_name }}</td>
                     <td>{{ call.area_name }}{% if call.area_number %} ({{ call.area_number }}){% endif %}</td>
@@ -234,10 +257,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         {% endif %}
                     </td>
                     <td>{{ "%.0f ms"|format(call.response_time_ms) if call.response_time_ms else '-' }}</td>
+                    {% if view == 'advanced' %}
+                    <td>{{ call.attempts if call.attempts is not none else '-' }}</td>
+                    <td>{{ call.last_error if call.last_error else '-' }}</td>
+                    <td>{{ call.state if call.state else '-' }}</td>
+                    {% endif %}
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="8" class="empty-msg">No calls recorded yet.</td></tr>
+                <tr><td colspan="{{ 11 if view == 'advanced' else 8 }}" class="empty-msg">No calls recorded yet.</td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -245,7 +273,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     {% if total_pages > 1 %}
     <div class="pagination">
         {% if page > 1 %}
-            <a href="?page={{ page - 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">&laquo; Prev</a>
+            <a href="?page={{ page - 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">&laquo; Prev</a>
         {% else %}
             <span class="disabled">&laquo; Prev</span>
         {% endif %}
@@ -254,7 +282,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% if p == page %}
                 <span class="current">{{ p }}</span>
             {% elif p <= 3 or p > total_pages - 2 or (p >= page - 1 and p <= page + 1) %}
-                <a href="?page={{ p }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">{{ p }}</a>
+                <a href="?page={{ p }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">{{ p }}</a>
             {% elif p == 4 and page > 5 %}
                 <span class="disabled">&hellip;</span>
             {% elif p == total_pages - 2 and page < total_pages - 4 %}
@@ -263,7 +291,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         {% endfor %}
 
         {% if page < total_pages %}
-            <a href="?page={{ page + 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}">Next &raquo;</a>
+            <a href="?page={{ page + 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">Next &raquo;</a>
         {% else %}
             <span class="disabled">Next &raquo;</span>
         {% endif %}
@@ -625,7 +653,9 @@ def _read_log_tail(log_path: str, num_lines: int = 50) -> list[str]:
         return []
 
 
-def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Optional[LoggingConfig] = None) -> FastAPI:
+def create_dashboard(db: CallDatabase, config: DashboardConfig,
+                     log_config: Optional[LoggingConfig] = None,
+                     health_config=None) -> FastAPI:
     """Create the FastAPI dashboard application."""
     from jinja2 import Environment
 
@@ -645,15 +675,26 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         page: int = Query(1, ge=1),
         auto: int = Query(0, ge=0, le=1),
         refresh: int = Query(config.auto_refresh_seconds),
+        view: str = Query("summary"),
     ):
+        # #13-P1: invalid view value falls back to summary (never a 500).
+        if view not in ("summary", "advanced"):
+            view = "summary"
         page_size = config.page_size
         calls, total_calls, total_pages = await db.get_calls_page(
             page=page, page_size=page_size, today_only=True,
         )
 
+        # #12: stored timestamps are UTC; nurses see local wall time derived
+        # from the canonical created_at epoch (not the raw stored string).
+        tz_name = log_config.timezone if log_config else ""   # "" = host local
+        for c in calls:
+            c["display_time"] = display_local(c.get("created_at"), tz_name)
+
         stats = await db.get_today_stats()
         success = stats["success"]
         failed = stats["failed"]
+        pending = stats.get("pending", 0)
 
         log_lines = _read_log_tail(log_file)
         api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
@@ -668,10 +709,12 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             total_calls=total_calls,
             success_calls=success,
             failed_calls=failed,
+            pending_calls=pending,
             page=page,
             total_pages=total_pages,
             auto_refresh=bool(auto),
             refresh_seconds=refresh,
+            view=view,
             log_lines=log_lines,
             api_debug_lines=api_debug_lines,
             sip_debug_lines=sip_debug_lines,
@@ -683,6 +726,60 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
         """JSON API for recent calls."""
         calls = await db.get_recent_calls(limit=limit)
         return {"calls": calls}
+
+    @app.get("/export.csv")
+    async def export_csv():
+        """#13-P1: stream today's REAL calls as CSV.
+
+        db.export_calls enforces 'AND is_test=0', so no dry-run/test row can
+        leak. Rows are quoted by the stdlib csv module (not HTML-escaped).
+        """
+        rows = await db.export_calls(today_only=True)
+        tz_name = log_config.timezone if log_config else ""   # "" = host local
+
+        def _safe(v):
+            # Guard against CSV/formula injection when opened in a spreadsheet:
+            # neutralize a leading = + - @ (and control chars) on text cells.
+            s = "" if v is None else str(v)
+            if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+                s = "'" + s
+            return s
+
+        def generate():
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow([
+                "Time (local)", "Caller ID", "Area", "Room",
+                "TTS String", "State", "Fusion Status",
+            ])
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+            for r in rows:
+                area = r.get("area_name") or ""
+                if r.get("area_number"):
+                    area = f"{area} ({r.get('area_number')})".strip()
+                room = r.get("room_number")
+                writer.writerow([
+                    display_local(r.get("created_at"), tz_name),
+                    _safe(r.get("caller_id")),
+                    _safe(area),
+                    _safe(room if room is not None else ""),
+                    _safe(r.get("tts_string")),
+                    _safe(r.get("state")),
+                    r.get("fusion_status") if r.get("fusion_status") is not None else "",
+                ])
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+
+        today = display_local(time.time(), tz_name)[:10]   # YYYY-MM-DD (local)
+        filename = f"sipgw-calls-{today}.csv"
+        return StreamingResponse(
+            generate(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     lookups_file = os.environ.get("SIPGW_LOOKUPS", "/opt/sipgw/lookups.yaml")
 
@@ -701,8 +798,18 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig, log_config: Opti
             headers={"Content-Disposition": "attachment; filename=lookups-sample.yaml"},
         )
 
+    stale_after = getattr(health_config, "stale_after_seconds", 30.0)
+
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        # #7 real liveness: healthy only if the writer's heartbeat is fresh.
+        beat = await db.read_heartbeat("writer")
+        if beat is None:
+            return JSONResponse(status_code=503, content={"status": "no-heartbeat"})
+        age = time.time() - beat
+        if age > stale_after:
+            return JSONResponse(status_code=503,
+                                content={"status": "stale", "heartbeat_age_s": round(age, 1)})
+        return {"status": "ok", "heartbeat_age_s": round(age, 1)}
 
     return app

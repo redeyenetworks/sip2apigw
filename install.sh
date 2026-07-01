@@ -82,12 +82,16 @@ chmod 750 "$INSTALL_DIR/install.sh" "$INSTALL_DIR/uninstall.sh"
 chmod 640 "$INSTALL_DIR/config.yaml"
 chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/config.yaml"
 
-# --- Install systemd unit ---
-echo "[7/7] Installing systemd service..."
+# --- Install systemd units ---
+# #14 two-service split: sipgw.service is the life-safety WRITER (SIP + delivery
+# + heartbeat + watchdog); sipgw-dashboard.service is the read-only dashboard.
+echo "[7/7] Installing systemd services..."
 cp "$INSTALL_DIR/sipgw.service" /etc/systemd/system/sipgw.service
+cp "$INSTALL_DIR/sipgw-dashboard.service" /etc/systemd/system/sipgw-dashboard.service
 systemctl daemon-reload
 systemctl enable sipgw.service
-echo "  Service installed and enabled."
+systemctl enable sipgw-dashboard.service
+echo "  Services installed and enabled (sipgw + sipgw-dashboard)."
 
 echo ""
 echo "=== Installation complete ==="
@@ -95,8 +99,10 @@ echo ""
 echo "Next steps:"
 echo "  1. Edit /opt/sipgw/config.yaml and set the Fusion client_secret"
 echo "  2. Review /opt/sipgw/lookups.yaml for area mappings"
-echo "  3. Start the service: systemctl start sipgw"
-echo "  4. Check status: systemctl status sipgw"
-echo "  5. View logs: journalctl -u sipgw -f"
-echo "  6. Dashboard: http://$(hostname -I | awk '{print $1}'):8080"
+echo "  3. Start the writer:    systemctl start sipgw"
+echo "  4. Start the dashboard: systemctl start sipgw-dashboard"
+echo "  5. Check status: systemctl status sipgw sipgw-dashboard"
+echo "  6. View logs: journalctl -u sipgw -f   (writer)"
+echo "               journalctl -u sipgw-dashboard -f   (dashboard)"
+echo "  7. Dashboard: http://$(hostname -I | awk '{print $1}'):8080"
 echo ""

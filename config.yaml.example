@@ -1,3 +1,19 @@
+# =============================================================================
+# sipgw config.yaml — shared by BOTH services in the #14 two-service topology:
+#   * sipgw.service            — the WRITER: SIP listener + durable delivery
+#                                worker + heartbeat + systemd watchdog. Owns ALL
+#                                writes to database.path and to the log files.
+#   * sipgw-dashboard.service  — the DASHBOARD: read-only web UI + /health.
+#                                Opens database.path READ-ONLY (query_only=ON),
+#                                only READS the writer's heartbeat row for
+#                                /health, and logs to its OWN sipgw_dashboard.log
+#                                (never the writer's rotating log files).
+# Both processes load THIS file. `dashboard:` and `health:` are consumed by the
+# dashboard process; `sip:`, `delivery:`, `escalation:` by the writer; the rest
+# (fusion/logging/database/dedupe) by both. Run `python -m sipgw.dashboard_app
+# <config>` for the dashboard and `python -m sipgw.main <config>` for the writer.
+# =============================================================================
+
 sip:
   bind_ip: "0.0.0.0"
   bind_port: 5060
@@ -30,7 +46,7 @@ logging:
   log_dir: "/var/log/sipgw"
   retention_days: 90
   rotation_time: "midnight"
-  timezone: "America/New_York"
+  timezone: ""              # empty = host local tz (hosts are UTC); set an IANA name to override
   api_debug_log: true
   sip_debug_log: true
 
@@ -40,5 +56,37 @@ dashboard:
   auto_refresh_seconds: 30
   page_size: 20
 
+health:
+  # The writer stamps a heartbeat every heartbeat_interval_seconds; the
+  # dashboard process reads it and reports /health 503 once it is older than
+  # stale_after_seconds (a single source of truth — no duplicate dashboard key).
+  heartbeat_interval_seconds: 10.0
+  stale_after_seconds: 30.0
+
 database:
   path: "/var/lib/sipgw/calls.db"
+
+escalation:
+  # Human alert channel for pages that fail delivery or expire
+  # (Teams/Slack/PagerDuty/NOC webhook). Empty disables escalation
+  # (failures are still logged at ERROR). In dry-run the escalation client
+  # carries the no-send guard, so this URL is blocked in testing.
+  webhook_url: ""
+  timeout_seconds: 10.0
+
+# --- #5 clinical dedupe (SHADOW / DISABLED) --------------------------------
+# SAFETY: a real second Code Blue for the same room must NEVER be dropped.
+# This ships inert: enforce=false (never suppresses) and window_seconds=0
+# (the shadow duplicate lookup never even runs). Setting enforce=true is a
+# FATAL config error — suppression requires clinical sign-off and is not
+# approved. window_seconds > 0 only turns on 'WOULD suppress' shadow telemetry;
+# every page is still delivered.
+dedupe:
+  enforce: false
+  window_seconds: 0
+
+# --- #12 timestamps note ---------------------------------------------------
+# Stored call `timestamp` is canonical UTC RFC3339 millis-Z. The dashboard
+# displays LOCAL wall-clock (and the "today" boundary is computed) using
+# `logging.timezone` above. Bucketing keys off the numeric created_at epoch, so
+# legacy local-format rows and new UTC rows both classify correctly.

@@ -65,14 +65,15 @@ def _log_request(response: httpx.Response, label: str, mask_secrets: bool = True
             body_text = req.content.decode("utf-8", errors="replace")
         except Exception:
             body_text = repr(req.content[:500])
-        # Mask client_secret in form-encoded bodies
-        if mask_secrets and "client_secret=" in body_text:
+        # Mask credentials in form-encoded bodies: client_secret AND client_id.
+        if mask_secrets and isinstance(body_text, str):
             import re
-            body_text = re.sub(
-                r"(client_secret=)[^&]+",
-                lambda m: m.group(1) + m.group(0)[len(m.group(1)):len(m.group(1))+8] + "***",
-                body_text,
-            )
+
+            def _mask(m):
+                return m.group(1) + m.group(2)[:4] + "***"
+
+            body_text = re.sub(r"(client_secret=)([^&]+)", _mask, body_text)
+            body_text = re.sub(r"(client_id=)([^&]+)", _mask, body_text)
         api_debug.info("  Body:    %s", body_text)
     else:
         api_debug.info("  Body:    (empty)")
@@ -108,6 +109,21 @@ def _log_request(response: httpx.Response, label: str, mask_secrets: bool = True
     api_debug.info("-" * 72)
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header.
+
+    Only the delta-seconds form is honored. The HTTP-date form returns None so
+    the delivery worker falls back to its exponential backoff (runbook note).
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return secs if secs >= 0 else None
+
+
 class FusionWebhook:
     """Client for Informacast Fusion Scenarios API with OAuth2 auth."""
 
@@ -117,32 +133,97 @@ class FusionWebhook:
         self._client: Optional[httpx.AsyncClient] = None
         self._field_id: Optional[str] = config.scenario_field_id or None
         self._token_lock = asyncio.Lock()
+        self._dry_run: bool = False
+        self._transport = None  # NoSendGuardTransport when dry-run is active
+        # Delta-seconds parsed from the last response's Retry-After header (or
+        # None). Read by the #2 delivery worker to schedule the next attempt.
+        self.last_retry_after: Optional[float] = None
+        # #4 background token refresh.
+        self._refresh_margin: float = float(
+            getattr(config, "token_refresh_margin_seconds", 300))
+        self._refresh_task = None
+        self._refresh_running = False
 
     async def initialize(self) -> None:
-        """Create the HTTP client."""
+        """Create the HTTP client.
+
+        In effective dry-run, install the NoSendGuardTransport so no request can
+        reach a non-127.0.0.1 host. This is the structural NO-SEND guarantee that
+        covers every Fusion origin sharing this client.
+        """
+        from .safety import NoSendGuardTransport, effective_dry_run, DRY_RUN_BANNER
+
+        self._dry_run = effective_dry_run(getattr(self.config, "dry_run", False))
+        self._transport = NoSendGuardTransport() if self._dry_run else None
+
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
+            transport=self._transport,  # None -> httpx default transport
         )
-        logger.info(f"Webhook client initialized for {self.config.base_url}")
+        if self._dry_run:
+            logger.critical(DRY_RUN_BANNER)
+        logger.info(
+            f"Webhook client initialized for {self.config.base_url}"
+            f"{' [DRY-RUN: no-send guard active]' if self._dry_run else ''}"
+        )
+
+    async def _refresh_loop(self) -> None:
+        """Keep a fresh token cached, renewing ~refresh_margin before expiry."""
+        while self._refresh_running:
+            sleep_for = 30.0
+            try:
+                await self._get_token(min_remaining=self._refresh_margin)
+                if self._token:
+                    sleep_for = max(
+                        30.0,
+                        (self._token.expires_at - time.time()) - self._refresh_margin,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("proactive token refresh failed: %s: %s",
+                               type(e).__name__, e)
+            await asyncio.sleep(min(sleep_for, 3600.0))
+
+    async def start_token_refresh(self) -> None:
+        if self._refresh_task is not None:
+            return
+        self._refresh_running = True
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+        logger.info("background token refresh started (margin=%ss)", int(self._refresh_margin))
+
+    async def stop_token_refresh(self) -> None:
+        self._refresh_running = False
+        if self._refresh_task:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
 
     async def close(self) -> None:
         """Close the HTTP client."""
+        await self.stop_token_refresh()
         if self._client:
             await self._client.aclose()
             self._client = None
 
-    async def _get_token(self) -> str:
-        """Get a valid OAuth2 access token, refreshing if needed."""
-        # Return cached token if still valid (with 60s buffer)
-        if self._token and self._token.expires_at > time.time() + 60:
+    async def _get_token(self, min_remaining: float = 60.0) -> str:
+        """Get a valid OAuth2 access token, refreshing if it has less than
+        ``min_remaining`` seconds left. The on-demand path uses 60s; the
+        background refresher (#4) passes the larger refresh margin so the token
+        is renewed well before any page needs it.
+        """
+        if self._token and self._token.expires_at > time.time() + min_remaining:
             api_debug.debug("Using cached token (expires in %ds)",
                             int(self._token.expires_at - time.time()))
             return self._token.access_token
 
         async with self._token_lock:
             # Re-check after acquiring lock (another coroutine may have refreshed)
-            if self._token and self._token.expires_at > time.time() + 60:
+            if self._token and self._token.expires_at > time.time() + min_remaining:
                 return self._token.access_token
 
             logger.info("Fetching new OAuth2 token")
@@ -187,8 +268,9 @@ class FusionWebhook:
                 logger.error(f"Failed to get OAuth2 token: HTTP {e.response.status_code} - {body[:200]}")
                 raise
             except Exception as e:
-                api_debug.error("TOKEN REQUEST EXCEPTION: %s", e, exc_info=True)
-                logger.error(f"Failed to get OAuth2 token: {e}")
+                api_debug.error("TOKEN REQUEST EXCEPTION: %s: %s",
+                                type(e).__name__, e, exc_info=True)
+                logger.error(f"Failed to get OAuth2 token: {type(e).__name__}: {e}")
                 raise
 
     async def _resolve_field_id(self) -> str:
@@ -226,6 +308,16 @@ class FusionWebhook:
                 )
                 return self._field_id
 
+        # In dry-run the scenario body is synthetic (from NoSendGuardTransport)
+        # and will not contain the configured variable. Accept the synthetic
+        # field id so the no-send path completes; this branch never runs in prod
+        # (dry-run off, real scenario carries the real field).
+        if self._dry_run:
+            fields = scenario.get("fields") or [{}]
+            self._field_id = fields[0].get("id", "DRYRUN.no-send.field-id")
+            logger.info("[dry-run] using synthetic field id %s", self._field_id)
+            return self._field_id
+
         raise ValueError(
             f"Scenario {self.config.scenario_id} has no field "
             f"with variable '{self.config.variable_name}'"
@@ -248,6 +340,7 @@ class FusionWebhook:
             await self.initialize()
 
         start_time = time.monotonic()
+        self.last_retry_after = None
         url = self.config.base_url.rstrip("/") + self.config.scenario_endpoint
 
         try:
@@ -293,10 +386,14 @@ class FusionWebhook:
 
                 logger.info(f"Fusion webhook retry: status={response.status_code}")
 
+            # Surface Retry-After (delta-seconds only) for the delivery worker.
+            self.last_retry_after = _parse_retry_after(response.headers.get("Retry-After"))
             return response.status_code, elapsed_ms
 
         except Exception as e:
             elapsed_ms = (time.monotonic() - start_time) * 1000
-            api_debug.error("SCENARIO TRIGGER EXCEPTION (elapsed=%.1fms): %s", elapsed_ms, e, exc_info=True)
-            logger.error(f"Fusion webhook error: {e} (elapsed={elapsed_ms:.1f}ms)")
+            api_debug.error("SCENARIO TRIGGER EXCEPTION (elapsed=%.1fms): %s: %s",
+                            elapsed_ms, type(e).__name__, e, exc_info=True)
+            logger.error(f"Fusion webhook error: {type(e).__name__}: {e} "
+                         f"(elapsed={elapsed_ms:.1f}ms)")
             return -1, elapsed_ms
