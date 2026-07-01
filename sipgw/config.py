@@ -34,6 +34,10 @@ class FusionConfig:
     scenario_field_id: str = ""
     client_id: str = ""
     client_secret: str = ""
+    # When True (or when env SIPGW_DRY_RUN=1), the webhook HTTP client is built
+    # with the NoSendGuardTransport so NO outbound notification can reach a real
+    # host. Env can only ENABLE this, never disable it. See sipgw/safety.py.
+    dry_run: bool = False
 
 
 @dataclass

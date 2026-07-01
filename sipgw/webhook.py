@@ -117,14 +117,32 @@ class FusionWebhook:
         self._client: Optional[httpx.AsyncClient] = None
         self._field_id: Optional[str] = config.scenario_field_id or None
         self._token_lock = asyncio.Lock()
+        self._dry_run: bool = False
+        self._transport = None  # NoSendGuardTransport when dry-run is active
 
     async def initialize(self) -> None:
-        """Create the HTTP client."""
+        """Create the HTTP client.
+
+        In effective dry-run, install the NoSendGuardTransport so no request can
+        reach a non-127.0.0.1 host. This is the structural NO-SEND guarantee that
+        covers every Fusion origin sharing this client.
+        """
+        from .safety import NoSendGuardTransport, effective_dry_run, DRY_RUN_BANNER
+
+        self._dry_run = effective_dry_run(getattr(self.config, "dry_run", False))
+        self._transport = NoSendGuardTransport() if self._dry_run else None
+
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
+            transport=self._transport,  # None -> httpx default transport
         )
-        logger.info(f"Webhook client initialized for {self.config.base_url}")
+        if self._dry_run:
+            logger.critical(DRY_RUN_BANNER)
+        logger.info(
+            f"Webhook client initialized for {self.config.base_url}"
+            f"{' [DRY-RUN: no-send guard active]' if self._dry_run else ''}"
+        )
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -225,6 +243,16 @@ class FusionWebhook:
                     f"Resolved field '{self.config.variable_name}' -> {self._field_id}"
                 )
                 return self._field_id
+
+        # In dry-run the scenario body is synthetic (from NoSendGuardTransport)
+        # and will not contain the configured variable. Accept the synthetic
+        # field id so the no-send path completes; this branch never runs in prod
+        # (dry-run off, real scenario carries the real field).
+        if self._dry_run:
+            fields = scenario.get("fields") or [{}]
+            self._field_id = fields[0].get("id", "DRYRUN.no-send.field-id")
+            logger.info("[dry-run] using synthetic field id %s", self._field_id)
+            return self._field_id
 
         raise ValueError(
             f"Scenario {self.config.scenario_id} has no field "

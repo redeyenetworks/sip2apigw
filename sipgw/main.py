@@ -145,6 +145,19 @@ def main():
     # Setup logging
     setup_logging(config.logging)
 
+    # --- §2 safety gates: dry-run marker + hard production-DB barrier ---
+    # Run BEFORE anything constructs the database or does network I/O.
+    from .safety import (
+        effective_dry_run, install_test_marker,
+        assert_safe_database_path, DRY_RUN_BANNER,
+    )
+    dry_run = effective_dry_run(config.fusion.dry_run)
+    if dry_run:
+        install_test_marker()          # every subsequent log line is [TEST]-marked
+        logger.critical(DRY_RUN_BANNER)
+    # Refuse to start if dry-run/test mode would write to the production DB.
+    assert_safe_database_path(config.database.path, dry_run)
+
     # Load lookup tables
     lookups_path = os.environ.get("SIPGW_LOOKUPS", "/opt/sipgw/lookups.yaml")
     load_lookups(lookups_path)
