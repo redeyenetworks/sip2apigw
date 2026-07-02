@@ -24,6 +24,15 @@ Observability follow-up to #12. Log-file timestamps are now unambiguous.
   calendar day (self-consistent). No rotation/compression/retention behavior
   changed. No SIP/delivery/call-path change — purely additive observability.
 - Operators: log scrapers expecting the old local stamp must adjust to `...T...Z`.
+- **#9 unknown-key startup warnings (final acceptance criterion).** Misspelled
+  config keys (e.g. `sip.imediate_bye`) and unknown top-level sections are now
+  surfaced as **non-fatal** startup warnings naming the offending key
+  (`unknown key 'sip.imediate_bye' ignored (typo?)`) instead of being silently
+  dropped. Unknown keys are still **not applied** (the real field keeps its
+  default), and this is warning-only — an unexpected/forward-compat key never
+  refuses to start prod. Warnings ride the existing `validate_config` warning
+  loop, so both the gateway and the dashboard log them with no caller change.
+  Completes #9 (the fatal-validation half shipped in v1.6.0).
 
 ## [v1.6.0] — 2026-07-01
 

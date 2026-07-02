@@ -1,9 +1,11 @@
 """#9 config validation tests."""
 
+import textwrap
+
 import pytest
 
 from sipgw.config import (
-    AppConfig, ConfigError, FusionConfig, validate_config,
+    AppConfig, ConfigError, FusionConfig, load_config, validate_config,
 )
 
 
@@ -94,3 +96,51 @@ class TestStructuralValidation:
         c.escalation.webhook_url = "hooks.example.com/escalation"  # no scheme
         with pytest.raises(ConfigError):
             validate_config(c, dry_run=False)
+
+
+class TestUnknownKeyWarnings:
+    """#9 remaining acceptance criterion: unknown/misspelled keys are surfaced
+    as non-fatal startup warnings (and still dropped, not applied)."""
+
+    def _write(self, tmp_path, text: str) -> str:
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent(text))
+        return str(p)
+
+    def test_typo_section_key_warns_and_is_not_applied(self, tmp_path):
+        path = self._write(tmp_path, """
+            sip:
+              imediate_bye: true
+        """)
+        config = load_config(path)
+        # Unknown key still dropped -> the real field keeps its default.
+        assert config.sip.immediate_bye is False
+        assert any("imediate_bye" in w for w in config.load_warnings)
+        # And it flows through validate_config's returned warnings.
+        warnings = validate_config(config, dry_run=True)
+        assert any("imediate_bye" in w for w in warnings)
+
+    def test_unknown_top_level_section_warns(self, tmp_path):
+        path = self._write(tmp_path, """
+            bogus:
+              foo: 1
+        """)
+        config = load_config(path)
+        assert any("bogus" in w for w in config.load_warnings)
+        warnings = validate_config(config, dry_run=True)
+        assert any("bogus" in w for w in warnings)
+
+    def test_clean_config_has_no_unknown_key_warnings(self, tmp_path):
+        path = self._write(tmp_path, """
+            sip:
+              immediate_bye: true
+              bind_port: 5060
+            dedupe:
+              window_seconds: 0
+        """)
+        config = load_config(path)
+        assert config.load_warnings == []
+        assert config.sip.immediate_bye is True
+
+    def test_directly_constructed_appconfig_has_empty_load_warnings(self):
+        assert AppConfig().load_warnings == []

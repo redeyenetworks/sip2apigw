@@ -132,13 +132,24 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    # #9 Non-fatal warnings collected while loading (unknown/misspelled keys and
+    # unknown top-level sections). Not a config section; seeded into
+    # validate_config's returned warnings so both entry points log them.
+    load_warnings: List[str] = field(default_factory=list)
 
 
-def _apply_section(target, raw_dict: dict):
-    """Apply raw config dict values onto a dataclass instance."""
+def _apply_section(target, raw_dict: dict, section_name: str, warnings: List[str]):
+    """Apply raw config dict values onto a dataclass instance.
+
+    Unknown keys are NOT applied (existing behavior). #9: instead of silently
+    dropping them, record a non-fatal warning naming the offending key.
+    """
     for k, v in raw_dict.items():
         if hasattr(target, k):
             setattr(target, k, v)
+        else:
+            warnings.append(
+                f"unknown key '{section_name}.{k}' ignored (typo?)")
 
 
 def load_config(path: Optional[str] = None) -> AppConfig:
@@ -166,9 +177,19 @@ def load_config(path: Optional[str] = None) -> AppConfig:
             "dashboard": config.dashboard,
             "database": config.database,
         }
+        warnings: List[str] = []
         for section_name, target in section_map.items():
             if section_name in raw and isinstance(raw[section_name], dict):
-                _apply_section(target, raw[section_name])
+                _apply_section(target, raw[section_name], section_name, warnings)
+
+        # #9 Unknown top-level sections (typo'd or stray) are dropped too, but
+        # surfaced as warnings rather than swallowed silently.
+        for key in raw:
+            if key not in section_map:
+                warnings.append(
+                    f"unknown config section '{key}' ignored (typo?)")
+
+        config.load_warnings = warnings
 
     return config
 
@@ -188,7 +209,9 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
     import ipaddress
 
     errors: List[str] = []
-    warnings: List[str] = []
+    # #9 Seed with any unknown-key/section warnings collected during load so
+    # both entry points log them via their existing warning loop.
+    warnings: List[str] = list(getattr(config, "load_warnings", []))
     f = config.fusion
 
     for name, val in (("fusion.base_url", f.base_url), ("fusion.token_url", f.token_url)):

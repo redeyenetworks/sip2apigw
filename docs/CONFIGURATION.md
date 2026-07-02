@@ -59,6 +59,11 @@ sip:
 CIDR entries are a **fatal** config error (#9). An empty list is a warning and
 rejects all SIP sources.
 
+> **Misspelled or unknown keys** (e.g. `sip.imediate_bye`) and unknown top-level
+> sections are logged as **non-fatal** startup warnings naming the offending key
+> and are ignored (the real field keeps its default) — check the startup log for
+> `config: unknown key '…' ignored (typo?)` if a setting seems to have no effect (#9).
+
 ### Fusion Section (both services; credentials used by the writer)
 
 ```yaml
