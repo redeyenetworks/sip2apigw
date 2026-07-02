@@ -139,6 +139,7 @@ class SIPGateway:
                 purpose=get_call_purpose(caller.display_name),
                 row_id=row_id,
                 is_test=1 if self._dry_run else 0,
+                sip_call_id=call_id,   # #5 telemetry: log the current page's Call-ID too
             )
             if decision.duplicate_of is not None:
                 await self.db.record_duplicate_of(row_id, decision.duplicate_of)
