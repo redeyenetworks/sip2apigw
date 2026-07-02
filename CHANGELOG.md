@@ -14,6 +14,15 @@ life-safety invariants: no real outbound send in dev/test (`NoSendGuardTransport
 every DB open, and — above all — **a real page is never dropped, duplicated, or gated
 by any new machinery.**
 
+**Validated in production (2026-07-01).** Cut over on the live host after all six
+real-systemd drills passed there (Type=notify `READY`, watchdog kill+restart, dashboard
+crash isolation, WAL `-shm` under `ProtectSystem=strict`, two-process no-send,
+restart-recovery). Confirmed on a live Code Blue — call #303: INVITE → fingerprint
+`v1:c621e265…` → record-first `PENDING` row → Fusion **HTTP 200 in 795 ms** → overhead
+page fanned to **12 IP speakers**, delivered on attempt 1, `is_test=0`, no duplicate,
+no escalation. `lookups.yaml` preserved byte-identical and all 302 prior rows migrated
+losslessly.
+
 ### Added
 - **Durable, record-first delivery (#2)** — `on_call` now writes the page to the DB
   in state `pending` **before** any delivery is attempted (`main.py` record-first
@@ -101,14 +110,24 @@ by any new machinery.**
   read-only connection. SIP IP allowlist, credential masking, and Jinja
   `autoescape=True` are unchanged.
 
-### Deferred / gated on humans + real hosts
-- **Real-systemd watchdog + OOM isolation drills** — the `Type=notify` watchdog and
-  the dashboard `MemoryMax`/`CPUQuota` envelope are inert in CI/containers and must
-  be exercised under real systemd with cgroup controllers before cutover.
-- **#5 dedupe enforcement** stays SHADOW/DISABLED until clinical sign-off **and** a
-  real Rauland INVITE capture validate the clinical fingerprint against production
-  traffic; suppression is `validate_config`-forbidden today.
-- **Production cutover** of the two-service split remains a manual, operator-run step.
+### Deferred to future releases (tracked as open issues)
+v1.6.0 ships some issues partially by design; the remainder stays tracked and open:
+- **#5 dedupe enforcement** stays SHADOW/DISABLED (suppression is
+  `validate_config`-forbidden) until clinical sign-off **and** a real Rauland INVITE
+  capture validate the clinical fingerprint; adopting the **upstream event-id** as the
+  primary key is part of that follow-up.
+- **#7 Fusion-reachability keepalive probe** — `/health` reports the writer heartbeat
+  (dead-writer detection); an active Fusion-reachability / component-level probe is
+  not yet implemented.
+- **#12 log-line timezone offset** — stored DB timestamps and dashboard display are now
+  unambiguous (UTC stored, host-local shown), but the log **formatters**
+  (`logging_config.py`) still emit local time without an explicit offset.
+- **#15 upstream event-id extraction** — the retransmit-stable transaction fingerprint
+  shipped; parsing an upstream event-id header for cross-system correlation is open.
+- **#11 BYE-before-ACK (481) teardown race**, **#9** residual config-validation
+  coverage, and **#13** dashboard Phases 2–4 remain open with exact scope documented on
+  each issue.
+- **#17 Shared-nothing HA** (active/active, fail-open) is a separate future epic.
 
 ---
 

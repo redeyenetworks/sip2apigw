@@ -4,6 +4,8 @@ A production Python asyncio service that bridges **Rauland nurse call systems** 
 
 **v1.6.0** is the reliability + observability release. A page is now **recorded before it is sent** (record-first), delivered by a **durable retry worker** that survives a Fusion outage or a process crash, **escalated to a human channel** if it can never be delivered, and observed through a real heartbeat-backed `/health`. The dashboard runs as a **separate read-only process**, and the whole system is designed around a set of hard life-safety invariants (see [Safety Model](#safety-model)).
 
+> **Status:** v1.6.0 has been running in production since **2026-07-01**, validated on a live Code Blue (call #303: record-first → Fusion HTTP 200 in 795 ms → 12 IP speakers). See the [CHANGELOG](CHANGELOG.md).
+
 ---
 
 ## How It Works
