@@ -13,7 +13,7 @@ import pytest
 
 from sipgw.config import AppConfig, DedupeConfig, FusionConfig, ConfigError, validate_config
 from sipgw.parser import CallerInfo, parse_caller
-from sipgw.database import CallDatabase, STATE_DELIVERED
+from sipgw.database import CallDatabase, DuplicateMatch, STATE_DELIVERED
 from sipgw.dedupe import Deduper, compute_fingerprint
 from sipgw.webhook import FusionWebhook
 from sipgw.main import SIPGateway
@@ -177,6 +177,62 @@ class TestDeduperShadow:
         dd = Deduper(DedupeConfig(window_seconds=300))
         dec = await dd.evaluate(BrokenDB(), caller=_caller(), row_id=1, is_test=0)
         assert dec.suppress is False and dec.duplicate_of is None
+
+    @pytest.mark.asyncio
+    async def test_would_suppress_line_has_gap_and_both_call_ids(
+            self, tmp_path, caplog):
+        # The enriched SHADOW audit trail must be greppable per-hit: it logs the
+        # inter-page gap, the bed/purpose match flags, and BOTH pages' Call-IDs.
+        db = await _db(tmp_path)
+        r1 = await _pending(db)                 # prior page, sip_call_id="c"
+        r2 = await _pending(db)                 # this page
+        prior = await db.get_call(r1)
+        later = prior["created_at"] + 12.0      # 12s after the first page
+        dd = Deduper(DedupeConfig(enforce=False, window_seconds=300))
+        with caplog.at_level(logging.WARNING, logger="sipgw.dedupe"):
+            dec = await dd.evaluate(
+                db, caller=_caller(), row_id=r2, is_test=0,
+                sip_call_id="this-call", now=later)
+        # Still purely telemetry — duplicate found, but never suppressed.
+        assert dec.duplicate_of == r1
+        assert dec.suppress is False
+        msg = next(r.getMessage() for r in caplog.records
+                   if "WOULD suppress" in r.getMessage())
+        assert "gap=12.0s" in msg
+        assert "this_call_id=this-call" in msg
+        assert "dup_call_id=c" in msg
+        assert "bed_match=" in msg and "purpose_match=" in msg
+        await db.close()
+
+
+# ------------------------------------------------- find_recent_duplicate shape
+class TestFindRecentDuplicateReturn:
+    @pytest.mark.asyncio
+    async def test_match_returns_id_created_at_and_call_id(self, tmp_path):
+        # The richer return carries the prior row's created_at + sip_call_id so
+        # the caller can compute the inter-page gap and cross-reference Call-IDs.
+        db = await _db(tmp_path)
+        r1 = await _pending(db)                 # sip_call_id="c"
+        r2 = await _pending(db)
+        m = await db.find_recent_duplicate(
+            area_number="730", room_number="201", bed_number=None,
+            purpose="Code Blue", is_test=0, since_epoch=0.0, exclude_id=r2)
+        assert isinstance(m, DuplicateMatch)
+        assert m.id == r1
+        assert m.sip_call_id == "c"
+        assert isinstance(m.created_at, float) and m.created_at > 0
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_no_match_returns_none(self, tmp_path):
+        # No prior page in-window -> None (unchanged contract).
+        db = await _db(tmp_path)
+        r1 = await _pending(db)
+        m = await db.find_recent_duplicate(
+            area_number="730", room_number="999", bed_number=None,
+            purpose="Code Blue", is_test=0, since_epoch=0.0, exclude_id=r1)
+        assert m is None
+        await db.close()
 
 
 # --------------------------------------------------------------- validate_config

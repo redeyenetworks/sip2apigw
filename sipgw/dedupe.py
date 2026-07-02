@@ -106,6 +106,7 @@ class Deduper:
     async def evaluate(
         self, db, *, caller, purpose: Optional[str] = None,
         row_id: Optional[int] = None, is_test: int = 0,
+        sip_call_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> DedupeDecision:
         """Compute the clinical fingerprint and, if a window is configured,
@@ -116,6 +117,10 @@ class Deduper:
         ``window_seconds`` > 0 enables the shadow lookup; a match logs
         'WOULD suppress ...' but the returned decision still does NOT suppress
         unless ``enforce`` is True (which validate_config forbids in prod).
+
+        ``sip_call_id`` (this page's SIP Call-ID, optional) is logged alongside
+        the prior page's Call-ID purely to cross-reference the two pages in the
+        shadow audit trail; it never affects the decision.
 
         This method never raises on a lookup failure — it logs and returns a
         no-suppress decision, because dedupe telemetry must never break delivery.
@@ -152,20 +157,30 @@ class Deduper:
             return decision
 
         if dup is not None:
-            decision.duplicate_of = dup
+            # duplicate_of stays the int prior-row id (main.py hands it straight
+            # to record_duplicate_of); the richer fields are for the audit line.
+            decision.duplicate_of = dup.id
             decision.would_suppress = True
+            gap_seconds = now - dup.created_at
             if self.config.enforce:
                 # Unreachable in any validated config (validate_config makes
                 # enforce=True fatal). Present only so the enforce branch is
                 # testable; even so, main.py never gates delivery on it.
                 decision.suppress = True
                 logger.warning(
-                    "SUPPRESS page fp=%s row=%s duplicate_of=%s "
-                    "(window=%ss, enforce=ON)", fp, row_id, dup, window)
+                    "SUPPRESS page fp=%s row=%s duplicate_of=%s gap=%.1fs "
+                    "bed_match=%s purpose_match=%s this_call_id=%s dup_call_id=%s "
+                    "(window=%ss, enforce=ON)",
+                    fp, row_id, dup.id, gap_seconds,
+                    self.config.match_bed, self.config.match_purpose,
+                    sip_call_id, dup.sip_call_id, window)
             else:
                 logger.warning(
-                    "WOULD suppress page fp=%s row=%s duplicate_of=%s "
+                    "WOULD suppress page fp=%s row=%s duplicate_of=%s gap=%.1fs "
+                    "bed_match=%s purpose_match=%s this_call_id=%s dup_call_id=%s "
                     "(window=%ss) — SHADOW, delivering anyway",
-                    fp, row_id, dup, window)
+                    fp, row_id, dup.id, gap_seconds,
+                    self.config.match_bed, self.config.match_purpose,
+                    sip_call_id, dup.sip_call_id, window)
 
         return decision

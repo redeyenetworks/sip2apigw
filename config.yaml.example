@@ -76,11 +76,20 @@ escalation:
 
 # --- #5 clinical dedupe (SHADOW / DISABLED) --------------------------------
 # SAFETY: a real second Code Blue for the same room must NEVER be dropped.
-# This ships inert: enforce=false (never suppresses) and window_seconds=0
-# (the shadow duplicate lookup never even runs). Setting enforce=true is a
-# FATAL config error — suppression requires clinical sign-off and is not
-# approved. window_seconds > 0 only turns on 'WOULD suppress' shadow telemetry;
-# every page is still delivered.
+# This ships inert (safe-by-default): enforce=false (never suppresses) and
+# window_seconds=0 (the shadow duplicate lookup never even runs), so a fresh or
+# misconfigured deploy stays completely inert.
+#
+# Setting enforce=true is a FATAL config error — suppression requires clinical
+# sign-off and is not approved.
+#
+# window_seconds > 0 with enforce:false is SHADOW-ONLY TELEMETRY, never
+# suppression: it turns on the duplicate lookup so each clinical duplicate is
+# logged ('WOULD suppress ... gap=<inter-page seconds> ... this_call_id=..
+# dup_call_id=..') and annotated (duplicate_of) to measure the real duplicate
+# rate and gap distribution. Every page is STILL delivered. Operators enable
+# this (e.g. window_seconds: 60) on the live deploy to gather evidence; the
+# example stays 0 so nothing is measured until deliberately turned on.
 dedupe:
   enforce: false
   window_seconds: 0

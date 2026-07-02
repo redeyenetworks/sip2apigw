@@ -8,7 +8,7 @@ import logging
 import aiosqlite
 from datetime import datetime, timezone as _tz
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, NamedTuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -18,6 +18,20 @@ except Exception:  # pragma: no cover
 from .config import DatabaseConfig
 
 logger = logging.getLogger("sipgw.database")
+
+
+class DuplicateMatch(NamedTuple):
+    """#5 SHADOW telemetry: the prior clinical-duplicate row a lookup matched.
+
+    Purely informational (window_seconds is 0 in prod so this is never even
+    produced there). Carries the prior row's ``id`` (still the int the caller
+    stores in ``duplicate_of``), plus its ``created_at`` epoch and
+    ``sip_call_id`` so the audit line can log the inter-page gap and cross-
+    reference both pages' Call-IDs. NEVER gates delivery.
+    """
+    id: int
+    created_at: float
+    sip_call_id: Optional[str]
 
 
 # --- #12 canonical time helpers -------------------------------------------
@@ -362,13 +376,15 @@ class CallDatabase:
         bed_number: Optional[str], purpose: str, is_test: int,
         since_epoch: float, exclude_id: Optional[int] = None,
         match_bed: bool = True, match_purpose: bool = True,
-    ) -> Optional[int]:
+    ) -> Optional["DuplicateMatch"]:
         """#5 SHADOW clinical-dedupe lookup — TEST-ONLY path.
 
         Find the earliest PRIOR row with the same clinical identity created
         within the window (``created_at >= since_epoch`` — keyed off the numeric
         epoch per #12, NEVER the timestamp string), excluding the just-inserted
-        row (``exclude_id``). Returns that row's id, or None.
+        row (``exclude_id``). Returns a :class:`DuplicateMatch` (the row's id
+        plus its ``created_at`` epoch and ``sip_call_id`` for the audit line), or
+        None when there is no prior duplicate.
 
         area/room are stored columns and matched in SQL (leading zeros preserved
         by exact string match). bed and purpose are not stored as columns, so
@@ -388,7 +404,8 @@ class CallDatabase:
         if area_number is None or room_number is None:
             return None
 
-        sql = ("SELECT id, caller_id, display_name FROM calls "
+        sql = ("SELECT id, caller_id, display_name, created_at, sip_call_id "
+               "FROM calls "
                "WHERE area_number IS ? AND room_number IS ? AND is_test=? "
                "AND created_at >= ?")
         params: list = [area_number, room_number, is_test, since_epoch]
@@ -410,7 +427,11 @@ class CallDatabase:
                 cand_purpose = get_call_purpose(row["display_name"] or "").strip().lower()
                 if cand_purpose != want_purpose:
                     continue
-            return row["id"]
+            return DuplicateMatch(
+                id=row["id"],
+                created_at=row["created_at"],
+                sip_call_id=row["sip_call_id"],
+            )
         return None
 
     async def record_duplicate_of(self, call_id: int, duplicate_of: int) -> None:
