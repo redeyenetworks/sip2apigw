@@ -98,9 +98,16 @@ class EscalationConfig:
 
 @dataclass
 class HealthConfig:
-    """#7 liveness heartbeat + /health staleness."""
+    """#7 liveness heartbeat + /health staleness + Fusion reachability keepalive.
+
+    ``keepalive_interval_seconds`` paces the writer-side, READ-ONLY Fusion
+    reachability probe (a bounded GET of the scenario — never a page). Its result
+    is stamped to the DB and surfaced in /health as INFORMATIONAL fields only; it
+    NEVER changes the /health status code (still heartbeat-driven).
+    """
     heartbeat_interval_seconds: float = 10.0
     stale_after_seconds: float = 30.0
+    keepalive_interval_seconds: float = 300.0
 
 
 @dataclass
@@ -274,6 +281,15 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
         errors.append(f"dashboard.port out of range: {config.dashboard.port}")
     if not config.database.path:
         errors.append("database.path is required")
+
+    # #7 Fusion reachability keepalive cadence. Purely informational telemetry,
+    # so an odd value is never fatal — but a tiny interval would hammer Fusion
+    # with reachability GETs, and <=0 would busy-spin the probe loop.
+    if config.health.keepalive_interval_seconds < 30.0:
+        warnings.append(
+            f"health.keepalive_interval_seconds is "
+            f"{config.health.keepalive_interval_seconds} (<30s) — the Fusion "
+            f"reachability probe may hammer Fusion; consider >= 60s")
 
     if errors:
         raise ConfigError(

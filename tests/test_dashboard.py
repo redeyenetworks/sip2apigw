@@ -57,6 +57,11 @@ def mock_db():
     db.export_calls = AsyncMock(return_value=SAMPLE_CALLS)
     import time as _t
     db.read_heartbeat = AsyncMock(return_value=_t.time())   # #7 fresh heartbeat
+    # #7 informational /health reads (additive; never affect the status code).
+    db.read_fusion_check = AsyncMock(return_value=None)
+    db.delivery_health_snapshot = AsyncMock(return_value={
+        "backlog": 0, "last_delivered_at": None,
+        "last_failed_at": None, "last_error": None})
     return db
 
 

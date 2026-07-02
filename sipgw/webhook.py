@@ -323,6 +323,49 @@ class FusionWebhook:
             f"with variable '{self.config.variable_name}'"
         )
 
+    async def check_reachable(self, timeout: float = 10.0) -> Tuple[bool, str]:
+        """#7 Bounded, READ-ONLY Fusion reachability probe.
+
+        Does a short-timeout GET of the scenario definition (same endpoint as
+        ``_resolve_field_id``) via the SHARED no-send-guarded client. It NEVER
+        triggers a scenario / sends a page — it is not a page path. In effective
+        dry-run the NoSendGuardTransport refuses the real host and returns a
+        synthetic 200, so this reaches NO real host.
+
+        Returns ``(ok, detail)`` where ``ok`` is True on a 2xx and ``detail`` is a
+        short human string. All errors are swallowed into ``(False, detail)`` so
+        the caller's keepalive loop never crashes.
+
+        Never holds the token lock across the network GET: ``_get_token`` only
+        locks while actually refreshing (the #4 background refresher keeps the
+        token warm), and the GET itself takes no lock — so the probe cannot delay
+        a real page waiting on the token lock.
+        """
+        if not self._client:
+            await self.initialize()
+
+        scenario_url = (
+            self.config.base_url.rstrip("/")
+            + "/v1/scenarios/"
+            + self.config.scenario_id
+        )
+        try:
+            token = await self._get_token()
+            response = await self._client.get(
+                scenario_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=httpx.Timeout(timeout, connect=timeout),
+            )
+            ok = 200 <= response.status_code < 300
+            detail = f"HTTP {response.status_code}"
+            if not ok:
+                logger.warning("Fusion reachability probe: %s", detail)
+            return ok, detail
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"[:200]
+            logger.warning("Fusion reachability probe failed: %s", detail)
+            return False, detail
+
     async def trigger_scenario(self, tts_text: str) -> Tuple[int, float]:
         """Trigger the Fusion scenario with the TTS text.
 

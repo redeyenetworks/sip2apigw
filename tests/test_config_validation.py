@@ -98,6 +98,32 @@ class TestStructuralValidation:
             validate_config(c, dry_run=False)
 
 
+class TestKeepaliveInterval:
+    """#7 health.keepalive_interval_seconds — additive; never fatal."""
+
+    def test_default_interval_no_warning(self):
+        # Default (300s) is sane and must not add a keepalive warning.
+        warnings = validate_config(_prod_ok(), dry_run=False)
+        assert not any("keepalive_interval_seconds" in w for w in warnings)
+
+    def test_tiny_interval_warns_not_fatal(self):
+        c = _prod_ok()
+        c.health.keepalive_interval_seconds = 1.0
+        warnings = validate_config(c, dry_run=False)   # must not raise
+        assert any("keepalive_interval_seconds" in w for w in warnings)
+
+    def test_keepalive_key_loaded_from_yaml(self, tmp_path):
+        import textwrap
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""
+            health:
+              keepalive_interval_seconds: 120.0
+        """))
+        config = load_config(str(p))
+        assert config.health.keepalive_interval_seconds == 120.0
+        assert config.load_warnings == []          # known key, no typo warning
+
+
 class TestUnknownKeyWarnings:
     """#9 remaining acceptance criterion: unknown/misspelled keys are surfaced
     as non-fatal startup warnings (and still dropped, not applied)."""

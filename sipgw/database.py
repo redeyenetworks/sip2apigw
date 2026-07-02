@@ -109,6 +109,19 @@ CREATE TABLE IF NOT EXISTS heartbeat (
 )
 """
 
+# #7 Fusion reachability keepalive result. The writer stamps the outcome of a
+# bounded, READ-ONLY reachability probe (ok + checked_at epoch + short detail);
+# the read-only dashboard reads it for the /health INFORMATIONAL fields. This
+# NEVER gates /health's status code — that stays heartbeat-driven.
+CREATE_FUSION_CHECK = """
+CREATE TABLE IF NOT EXISTS fusion_check (
+    name TEXT PRIMARY KEY,
+    ok INTEGER NOT NULL,
+    checked_at REAL NOT NULL,
+    detail TEXT
+)
+"""
+
 # #2 durable-delivery columns, added idempotently to the existing `calls` table.
 # ADD COLUMN fills pre-existing rows with the DEFAULT, so the 301 legacy prod
 # rows become state='legacy', attempts=0, is_test=0 without data loss.
@@ -197,6 +210,7 @@ class CallDatabase:
         await self._db.execute(CREATE_TABLE)
         await self._db.execute(CREATE_INDEX)
         await self._db.execute(CREATE_HEARTBEAT)
+        await self._db.execute(CREATE_FUSION_CHECK)   # #7 keepalive result row
         await self._migrate()
         await self._db.commit()
 
@@ -587,6 +601,74 @@ class CallDatabase:
             "SELECT beat_at FROM heartbeat WHERE name=?", (name,))
         row = await cur.fetchone()
         return row[0] if row else None
+
+    # ----------------------------------------------------------- #7 keepalive
+    async def write_fusion_check(self, ok: bool, detail: str = "",
+                                 name: str = "fusion") -> float:
+        """#7 Stamp the result of the writer's Fusion reachability probe.
+
+        Mirrors write_heartbeat's UPSERT (single row per ``name``). ``ok`` is the
+        reachability outcome, ``detail`` a short human string (truncated). Returns
+        the epoch it stamped. INFORMATIONAL only — never gates delivery or /health.
+        """
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO fusion_check (name, ok, checked_at, detail) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET ok=excluded.ok, "
+            "checked_at=excluded.checked_at, detail=excluded.detail",
+            (name, 1 if ok else 0, now, (detail or "")[:200]),
+        )
+        await self._db.commit()
+        return now
+
+    async def read_fusion_check(self, name: str = "fusion") -> Optional[Dict[str, Any]]:
+        """#7 Read the last stamped Fusion reachability result.
+
+        Returns ``{"ok": bool, "checked_at": float, "detail": str}`` or None if
+        never stamped. Safe under the dashboard's ``query_only=ON`` connection
+        (SELECT only). Tolerates the table not existing yet (older writer that
+        predates #7 hasn't created it): treated as "never checked" (None).
+        """
+        try:
+            cur = await self._db.execute(
+                "SELECT ok, checked_at, detail FROM fusion_check WHERE name=?", (name,))
+            row = await cur.fetchone()
+        except aiosqlite.OperationalError:
+            return None
+        if not row:
+            return None
+        return {"ok": bool(row[0]), "checked_at": row[1], "detail": row[2]}
+
+    async def delivery_health_snapshot(self) -> Dict[str, Any]:
+        """#7 Read-only INFORMATIONAL metrics for the /health body.
+
+        Returns backlog (pending+delivering REAL rows), the last successful
+        delivery epoch, and the last failure epoch + its truncated last_error.
+        SELECT-only, so safe under the dashboard's ``query_only=ON`` connection.
+        Excludes test rows (is_test=0) so dry-run drills never pollute /health.
+        """
+        counts = await self.count_by_state(include_test=False)
+        backlog = counts.get(STATE_PENDING, 0) + counts.get(STATE_DELIVERING, 0)
+
+        cur = await self._db.execute(
+            "SELECT MAX(delivered_at) FROM calls "
+            "WHERE state=? AND is_test=0", (STATE_DELIVERED,))
+        last_delivered_at = (await cur.fetchone())[0]
+
+        cur = await self._db.execute(
+            "SELECT created_at, last_error FROM calls "
+            "WHERE state IN (?, ?) AND is_test=0 "
+            "ORDER BY created_at DESC LIMIT 1", (STATE_FAILED, STATE_EXPIRED))
+        frow = await cur.fetchone()
+        last_failed_at = frow[0] if frow else None
+        last_error = frow[1] if frow else None
+
+        return {
+            "backlog": backlog,
+            "last_delivered_at": last_delivered_at,
+            "last_failed_at": last_failed_at,
+            "last_error": (last_error[:200] if last_error else None),
+        }
 
     async def close(self) -> None:
         """Close the database connection."""

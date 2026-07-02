@@ -51,6 +51,7 @@ class SIPGateway:
         # #14: the dashboard now runs as a separate process (sipgw.dashboard_app);
         # this writer process no longer serves HTTP.
         self._hb_task = None           # #7 heartbeat writer
+        self._keepalive_task = None    # #7 Fusion reachability keepalive
         self.watchdog = WatchdogPinger()   # #8 systemd watchdog (inert w/o systemd)
         self._shutdown_event = asyncio.Event()
 
@@ -63,6 +64,27 @@ class SIPGateway:
                 raise
             except Exception:
                 logger.exception("heartbeat write failed")
+            await asyncio.sleep(interval)
+
+    async def _keepalive_loop(self):
+        """#7 Periodically probe Fusion reachability (READ-ONLY) and stamp the
+        result to the DB for the /health INFORMATIONAL fields.
+
+        Modeled on _heartbeat_loop: a bounded check_reachable() GET every
+        keepalive_interval_seconds. It NEVER sends a page and NEVER gates
+        /health. All exceptions are guarded so the probe can never crash the
+        writer or block the page path. In dry-run the shared no-send guard means
+        the probe reaches no real host.
+        """
+        interval = getattr(self.config.health, "keepalive_interval_seconds", 300.0)
+        while True:
+            try:
+                ok, detail = await self.webhook.check_reachable()
+                await self.db.write_fusion_check(ok, detail)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("fusion reachability keepalive failed")
             await asyncio.sleep(interval)
 
     async def on_call(
@@ -145,6 +167,9 @@ class SIPGateway:
         # #7 stamp an initial heartbeat before /health is consulted.
         await self.db.write_heartbeat("writer")
         self._hb_task = asyncio.create_task(self._heartbeat_loop())
+        # #7 start the Fusion reachability keepalive (additive, read-only, never
+        # gates /health and never sends a page).
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
         # #8 tell systemd we are up and start watchdog pings BEFORE recovery.
         # A large recover() must not delay READY (watchdog restart loop); the
@@ -175,6 +200,12 @@ class SIPGateway:
                 self._hb_task.cancel()
                 try:
                     await self._hb_task
+                except asyncio.CancelledError:
+                    pass
+            if self._keepalive_task:
+                self._keepalive_task.cancel()
+                try:
+                    await self._keepalive_task
                 except asyncio.CancelledError:
                     pass
             await self.webhook.close()

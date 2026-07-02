@@ -800,9 +800,43 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
 
     stale_after = getattr(health_config, "stale_after_seconds", 30.0)
 
+    async def _health_info() -> dict:
+        """#7 INFORMATIONAL /health fields read from the shared DB.
+
+        Backlog, last delivered/failed timestamps + truncated last_error, and the
+        stamped Fusion reachability result. Read-only (safe under query_only=ON).
+        These are for humans/monitors ONLY — they NEVER influence the /health
+        status code, which stays keyed solely on writer-heartbeat freshness. Any
+        read failure is swallowed so /health can never 500 on an info read.
+        """
+        info: dict = {}
+        try:
+            snap = await db.delivery_health_snapshot()
+            info["backlog"] = snap.get("backlog")
+            info["last_delivered_at"] = snap.get("last_delivered_at")
+            info["last_failed_at"] = snap.get("last_failed_at")
+            info["last_error"] = snap.get("last_error")
+        except Exception:
+            pass
+        try:
+            fc = await db.read_fusion_check("fusion")
+            if fc is not None:
+                info["fusion_reachable"] = fc["ok"]
+                info["fusion_detail"] = fc["detail"]
+                if fc.get("checked_at") is not None:
+                    info["fusion_checked_age_s"] = round(time.time() - fc["checked_at"], 1)
+            else:
+                info["fusion_reachable"] = None
+        except Exception:
+            pass
+        return info
+
     @app.get("/health")
     async def health():
         # #7 real liveness: healthy only if the writer's heartbeat is fresh.
+        # The status CODE is SOLELY heartbeat-driven; the informational fields
+        # below never flip it (a Fusion blip / delivery backlog must not 503 the
+        # sole node or trip an external monitor into restarting/pulling it).
         beat = await db.read_heartbeat("writer")
         if beat is None:
             return JSONResponse(status_code=503, content={"status": "no-heartbeat"})
@@ -810,6 +844,8 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         if age > stale_after:
             return JSONResponse(status_code=503,
                                 content={"status": "stale", "heartbeat_age_s": round(age, 1)})
-        return {"status": "ok", "heartbeat_age_s": round(age, 1)}
+        body = {"status": "ok", "heartbeat_age_s": round(age, 1)}
+        body.update(await _health_info())
+        return body
 
     return app
