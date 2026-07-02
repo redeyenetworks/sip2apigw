@@ -4,6 +4,27 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.1] — 2026-07-02
+
+Observability follow-up to #12. Log-file timestamps are now unambiguous.
+
+- **#12 log timestamps → UTC RFC3339 millis-Z.** All log streams (`sipgw.log`,
+  `sipgw_api_debug.log`, `sipgw_sip_debug.log`, and the dashboard's own
+  `sipgw_dashboard.log`) now emit a canonical `YYYY-MM-DDTHH:MM:SS.mmmZ` stamp
+  via the new `ISO8601Formatter`, replacing the ambiguous space-separated
+  host-local `YYYY-MM-DD HH:MM:SS`. All streams are byte-for-byte zone-consistent,
+  UTC-sortable, and string-matchable against the Singlewire `Date`/`createdAt`
+  fields. This completes the log half of #12 (the DB/dashboard half shipped in
+  v1.6.0).
+- The dashboard and CSV export are unchanged — they still render **host-local**
+  wall-clock and compute the "today" boundary from `logging.timezone`. Log stamps
+  are hard-coded UTC-Z and are **not** driven by that knob.
+- The host runs UTC, so the #6 `when="midnight"` rotation continues to roll at
+  00:00 UTC; each day-file and the UTC-Z stamps inside it now share the same UTC
+  calendar day (self-consistent). No rotation/compression/retention behavior
+  changed. No SIP/delivery/call-path change — purely additive observability.
+- Operators: log scrapers expecting the old local stamp must adjust to `...T...Z`.
+
 ## [v1.6.0] — 2026-07-01
 
 Reliability + observability release. The gateway moves from best-effort,

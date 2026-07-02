@@ -11,7 +11,7 @@ import tarfile
 import logging
 import logging.handlers
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +50,26 @@ def stop_async_logging() -> None:
 
 
 atexit.register(stop_async_logging)
+
+
+class ISO8601Formatter(logging.Formatter):
+    """#12 Formatter that renders ``asctime`` as canonical UTC RFC3339 millis-Z.
+
+    Emits e.g. ``2026-07-01T18:23:45.007Z`` for every log line regardless of the
+    host timezone, mirroring ``database._utc_rfc3339`` (database.py:28). This
+    makes all three log streams (main / api_debug / sip_debug) byte-for-byte
+    zone-consistent, UTC-sortable, and string-matchable against the Singlewire
+    ``Date`` / ``createdAt`` fields for free far-end correlation. The dashboard
+    and CSV export continue to render host-local via ``display_local``; only the
+    log-file stamp is hard-coded UTC-Z.
+    """
+
+    def formatTime(self, record, datefmt=None):  # noqa: N802 (stdlib name)
+        return (
+            datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
 
 
 class CompressingTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
@@ -100,7 +120,11 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
 
     Sets up:
     - Console handler (stdout) with INFO level
-    - File handler with daily rotation at midnight ET, .tgz compression, 90-day retention
+    - File handler with daily rotation at UTC midnight, .tgz compression, 90-day
+      retention. The host runs UTC, so rotation rolls at 00:00 UTC (~20:00 ET);
+      the #6 ``when="midnight"`` day-files therefore align with the UTC calendar
+      day. Log stamps are UTC-Z (see ``ISO8601Formatter``), so the day-file
+      boundary and the timestamps inside each file are self-consistent.
 
     When ``dry_run`` is True, the [TEST] marker is installed on the sipgw loggers
     FIRST, so every line this function itself emits is also marked (§2b: every
@@ -118,9 +142,8 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
         from .safety import install_test_marker
         install_test_marker()
 
-    formatter = logging.Formatter(
+    formatter = ISO8601Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     # Console handler
@@ -164,9 +187,8 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
             atTime=None,
         )
         api_handler.setLevel(logging.DEBUG)
-        api_formatter = logging.Formatter(
+        api_formatter = ISO8601Formatter(
             fmt="%(asctime)s [%(levelname)s]: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
         )
         api_handler.setFormatter(api_formatter)
         api_handler.suffix = "%Y-%m-%d"
@@ -192,9 +214,8 @@ def setup_logging(config: Optional[LoggingConfig] = None, dry_run: bool = False)
             atTime=None,
         )
         sip_handler.setLevel(logging.DEBUG)
-        sip_formatter = logging.Formatter(
+        sip_formatter = ISO8601Formatter(
             fmt="%(asctime)s [%(levelname)s]: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
         )
         sip_handler.setFormatter(sip_formatter)
         sip_handler.suffix = "%Y-%m-%d"
@@ -243,9 +264,8 @@ def setup_dashboard_logging(config: Optional[LoggingConfig] = None,
         from .safety import install_test_marker
         install_test_marker()
 
-    formatter = logging.Formatter(
+    formatter = ISO8601Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     # Console handler (journald captures stdout/stderr under systemd).

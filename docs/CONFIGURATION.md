@@ -199,6 +199,18 @@ logging:
 - **#12 timezone.** `timezone` controls the dashboard's local wall-clock display
   and the "today" day-boundary. Stored timestamps are always canonical UTC (see
   [Timestamps](#timestamps-12)). `""` reads the host local tz (hosts run UTC).
+- **#12 log stamps (v1.6.1).** Every log line in all three streams (`sipgw.log`,
+  `sipgw_api_debug.log`, `sipgw_sip_debug.log`, plus the dashboard's own
+  `sipgw_dashboard.log`) is now stamped in **canonical UTC RFC3339 milliseconds-Z**
+  (e.g. `2026-07-01T18:23:45.007Z`), identical across streams and string-matchable
+  against the Singlewire `Date`/`createdAt` fields for free far-end correlation.
+  This is **hard-coded UTC-Z and not governed by `logging.timezone`** — that knob
+  only affects dashboard/CSV display and the day-boundary. To read a log stamp in
+  Eastern, subtract 4h (EDT) or 5h (EST). Because the host runs UTC, the #6
+  `when="midnight"` rotation rolls at 00:00 UTC (~20:00 ET), so each day-file and
+  the UTC-Z stamps inside it share the same UTC calendar day. Operators grepping
+  for the old space-separated `YYYY-MM-DD HH:MM:SS` local stamp must switch to the
+  `...T...Z` form.
 
 ### Dashboard Section (#14, #13; dashboard process)
 
