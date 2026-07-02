@@ -70,7 +70,7 @@ def _log_request(response: httpx.Response, label: str, mask_secrets: bool = True
             import re
 
             def _mask(m):
-                return m.group(1) + m.group(2)[:4] + "***"
+                return m.group(1) + "***"
 
             body_text = re.sub(r"(client_secret=)([^&]+)", _mask, body_text)
             body_text = re.sub(r"(client_id=)([^&]+)", _mask, body_text)

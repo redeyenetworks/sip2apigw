@@ -52,8 +52,14 @@ class TestCredentialMasking:
         with caplog.at_level(logging.INFO, logger="sipgw.api_debug"):
             _log_request(resp, "TOKEN TEST")
         text = caplog.text
-        # Full secret and full client_id must NOT appear; masked prefixes may.
+        # Full secret and full client_id must NOT appear.
         assert "OV7XUELSF3H5EBN23SFJRJVXTVR6PGOA24AVX" not in text
         assert "6ZBFCWBSJNTFSRNTXBQQ4BFQWOWD2IEB" not in text
-        assert "client_secret=" in text and "***" in text
-        assert "client_id=" in text
+        # No portion of the credentials may survive: not even the 4-char prefix.
+        assert "OV7X***" not in text
+        assert "OV7X" not in text
+        assert "6ZBF***" not in text
+        assert "6ZBF" not in text
+        # Credentials are fully redacted to the literal `=***` form.
+        assert "client_secret=***" in text
+        assert "client_id=***" in text
