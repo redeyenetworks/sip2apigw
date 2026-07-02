@@ -20,6 +20,65 @@ from .config import DashboardConfig, LoggingConfig
 
 logger = logging.getLogger("sipgw.dashboard")
 
+# #13-P1: hard cap on a requested export date range. A module constant (not a
+# config field) so no [export] section is introduced in this Phase-1-remainder
+# slice; the range route rejects anything wider with a 400 BEFORE any query.
+MAX_EXPORT_RANGE_DAYS = 400
+
+
+def _time_context(log_config: Optional["LoggingConfig"]) -> dict:
+    """#13-P1: server-side time context for the client time toggle.
+
+    Returns the configured display timezone name (or "local") and the no-JS
+    fallback format. Rendered into a <script id="sipgw-time-ctx"> JSON blob; the
+    client re-renders each row from its numeric data-epoch (created_at), so the
+    toggle is DST-correct and immune to the decorative timezone string.
+    """
+    tz_name = log_config.timezone if log_config else ""
+    return {"server_tz": tz_name or "local", "ts_format": "%Y-%m-%d %H:%M:%S"}
+
+
+def _plain_status(fusion_status) -> tuple:
+    """#13-P1: map a raw Fusion status to (glyph, text, css_class).
+
+    Plain-language + a glyph + (caller adds) an aria-label so delivery state is
+    never signalled by colour alone (WCAG). Mapping:
+      2xx        -> Delivered
+      -1         -> NOT SENT - delivery failed   (delivery exception)
+      other 4xx/5xx / non-2xx -> NOT SENT - rejected
+      NULL/None  -> Pending
+    """
+    if fusion_status is None:
+        return ("○", "Pending", "status-pending")            # hollow circle
+    try:
+        code = int(fusion_status)
+    except (TypeError, ValueError):
+        return ("○", "Pending", "status-pending")
+    if 200 <= code < 300:
+        return ("✓", "Delivered", "status-ok")               # check mark
+    if code == -1:
+        return ("✗", "NOT SENT - delivery failed", "status-err")
+    return ("✗", "NOT SENT - rejected", "status-err")         # cross mark
+
+
+def _fusion_result_text(fusion_status) -> str:
+    """#13-P1: friendly fusion_result for the CSV export column.
+
+      2xx -> delivered ; -1 -> FAILED (delivery exception) ;
+      other -> FAILED (HTTP n) ; NULL -> pending.
+    """
+    if fusion_status is None:
+        return "pending"
+    try:
+        code = int(fusion_status)
+    except (TypeError, ValueError):
+        return "pending"
+    if 200 <= code < 300:
+        return "delivered"
+    if code == -1:
+        return "FAILED (delivery exception)"
+    return f"FAILED (HTTP {code})"
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -108,9 +167,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             font-size: 0.85rem;
         }
         tr:hover { background: #1e2a4a; }
-        .status-ok { color: #4caf50; }
-        .status-err { color: #f44336; }
-        .status-pending { color: #ff9800; }
+        /* #13-P1: AA-contrast tokens on the #16213e table bg (old #4caf50/
+           #f44336 failed WCAG AA). Delivery state also carries a glyph + text
+           + aria-label, so meaning never relies on colour alone. */
+        .status-ok { color: #6ee7a8; }
+        .status-err { color: #ff9d9d; }
+        .status-pending { color: #ffcc80; }
+        .status-cell .glyph { font-weight: bold; margin-right: 4px; }
         .tts-col { max-width: 350px; word-wrap: break-word; }
         .empty-msg {
             text-align: center;
@@ -168,6 +231,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </style>
 </head>
 <body>
+    <script id="sipgw-time-ctx" type="application/json">{{ time_ctx | tojson }}</script>
     <div>
         <h1>sipgw Dashboard</h1>
     </div>
@@ -179,6 +243,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="controls">
             <a class="view-toggle" href="?view={% if view == 'advanced' %}summary{% else %}advanced{% endif %}&amp;page={{ page }}&amp;auto={{ '1' if auto_refresh else '0' }}&amp;refresh={{ refresh_seconds }}">{% if view == 'advanced' %}Summary view{% else %}Advanced view{% endif %}</a>
             <a class="view-toggle" href="/export.csv">Export CSV</a>
+            <label for="timeMode">Time</label>
+            <select id="timeMode" aria-label="Time display mode">
+                <option value="local">Local</option>
+                <option value="utc">UTC</option>
+                <option value="both">Both</option>
+            </select>
             <label>
                 <input type="checkbox" id="autoRefresh" {% if auto_refresh %}checked{% endif %}>
                 Auto-refresh
@@ -241,20 +311,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% if calls %}
                 {% for call in calls %}
                 <tr>
-                    <td>{{ call.display_time }}</td>
+                    <td class="time-cell" data-epoch="{{ call.created_at | tojson }}">{{ call.display_time }}</td>
                     <td>{{ call.caller_id }}</td>
                     <td>{{ call.display_name }}</td>
                     <td>{{ call.area_name }}{% if call.area_number %} ({{ call.area_number }}){% endif %}</td>
                     <td>{{ call.room_number if call.room_number is not none else '-' }}</td>
                     <td class="tts-col">{{ call.tts_string }}</td>
-                    <td>
-                        {% if call.fusion_status and call.fusion_status >= 200 and call.fusion_status < 300 %}
-                            <span class="status-ok">{{ call.fusion_status }}</span>
-                        {% elif call.fusion_status %}
-                            <span class="status-err">{{ call.fusion_status }}</span>
-                        {% else %}
-                            <span class="status-pending">pending</span>
-                        {% endif %}
+                    <td class="status-cell" aria-label="Delivery status: {{ call.status_text }}">
+                        <span class="{{ call.status_class }}"><span class="glyph" aria-hidden="true">{{ call.status_glyph }}</span>{{ call.status_text }}</span>
                     </td>
                     <td>{{ "%.0f ms"|format(call.response_time_ms) if call.response_time_ms else '-' }}</td>
                     {% if view == 'advanced' %}
@@ -349,6 +413,57 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             btn.textContent = 'Copy';
             btn.classList.remove('copied');
         }, 2000);
+    }
+
+    // #13-P1: time toggle (Local / UTC / Both). Reads each row's numeric
+    // data-epoch (created_at) and renders via Date + Intl so local time is
+    // DST-correct; server-rendered display_time stays as the no-JS fallback.
+    // All writes go through textContent, so any injected markup stays inert.
+    var TIME_MODE_KEY = 'sipgw.timeMode';
+    var timeModeSelect = document.getElementById('timeMode');
+
+    function pad2(n) { return (n < 10 ? '0' : '') + n; }
+    function fmtUTC(d) {
+        return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' +
+               pad2(d.getUTCDate()) + ' ' + pad2(d.getUTCHours()) + ':' +
+               pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds()) + ' UTC';
+    }
+    function fmtLocal(d) {
+        try {
+            return new Intl.DateTimeFormat(undefined, {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit',
+                hour12: false
+            }).format(d);
+        } catch (e) {
+            return d.toLocaleString();
+        }
+    }
+    function renderTimes() {
+        if (!timeModeSelect) return;
+        var mode = localStorage.getItem(TIME_MODE_KEY) || 'local';
+        var cells = document.querySelectorAll('.time-cell');
+        for (var i = 0; i < cells.length; i++) {
+            var raw = cells[i].getAttribute('data-epoch');
+            var epoch = parseFloat(raw);
+            if (isNaN(epoch)) continue;   // keep server fallback text
+            var d = new Date(epoch * 1000);
+            var local = fmtLocal(d);
+            var utc = fmtUTC(d);
+            var text;
+            if (mode === 'utc') text = utc;
+            else if (mode === 'both') text = local + '  /  ' + utc;
+            else text = local;
+            cells[i].textContent = text;
+        }
+    }
+    if (timeModeSelect) {
+        timeModeSelect.value = localStorage.getItem(TIME_MODE_KEY) || 'local';
+        timeModeSelect.addEventListener('change', function() {
+            localStorage.setItem(TIME_MODE_KEY, timeModeSelect.value);
+            renderTimes();
+        });
+        renderTimes();
     }
 
     // Auto-refresh logic
@@ -690,6 +805,11 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         tz_name = log_config.timezone if log_config else ""   # "" = host local
         for c in calls:
             c["display_time"] = display_local(c.get("created_at"), tz_name)
+            # #13-P1: plain-language delivery status (glyph + text + aria-label).
+            glyph, text, css = _plain_status(c.get("fusion_status"))
+            c["status_glyph"] = glyph
+            c["status_text"] = text
+            c["status_class"] = css
 
         stats = await db.get_today_stats()
         success = stats["success"]
@@ -718,6 +838,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             log_lines=log_lines,
             api_debug_lines=api_debug_lines,
             sip_debug_lines=sip_debug_lines,
+            time_ctx=_time_context(log_config),
         )
         return HTMLResponse(content=html)
 
@@ -728,14 +849,38 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         return {"calls": calls}
 
     @app.get("/export.csv")
-    async def export_csv():
-        """#13-P1: stream today's REAL calls as CSV.
+    async def export_csv(
+        scope: str = Query("today"),
+        start: Optional[float] = Query(None),
+        end: Optional[float] = Query(None),
+    ):
+        """#13-P1: stream REAL calls as CSV (today by default, or a bounded range).
 
-        db.export_calls enforces 'AND is_test=0', so no dry-run/test row can
-        leak. Rows are quoted by the stdlib csv module (not HTML-escaped).
+        Both DB methods (export_calls / get_calls_between) enforce 'AND is_test=0',
+        so no dry-run/test row can leak. Rows are quoted by the stdlib csv module
+        (not HTML-escaped) and text cells pass through the _safe() formula-injection
+        guard. scope=range requires start & end (epoch seconds) and is hard-capped
+        at MAX_EXPORT_RANGE_DAYS — an over-wide or malformed range is a 400 BEFORE
+        any query runs. Any other/bogus scope falls back safely to today (no 500).
         """
-        rows = await db.export_calls(today_only=True)
         tz_name = log_config.timezone if log_config else ""   # "" = host local
+
+        if scope == "range":
+            # Reject a malformed / unbounded range BEFORE touching the DB.
+            if start is None or end is None:
+                return PlainTextResponse(
+                    "scope=range requires numeric start and end epoch params",
+                    status_code=400)
+            if end < start:
+                return PlainTextResponse("end must be >= start", status_code=400)
+            if (end - start) > MAX_EXPORT_RANGE_DAYS * 86400:
+                return PlainTextResponse(
+                    f"range too large (max {MAX_EXPORT_RANGE_DAYS} days)",
+                    status_code=400)
+            rows = await db.get_calls_between(start, end)
+        else:
+            # today (default) — any unrecognized scope falls back here, never 500s.
+            rows = await db.export_calls(today_only=True)
 
         def _safe(v):
             # Guard against CSV/formula injection when opened in a spreadsheet:
@@ -751,6 +896,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             writer.writerow([
                 "Time (local)", "Caller ID", "Area", "Room",
                 "TTS String", "State", "Fusion Status",
+                "Time (UTC)", "Fusion Result",
             ])
             yield buf.getvalue()
             buf.seek(0)
@@ -760,6 +906,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                 if r.get("area_number"):
                     area = f"{area} ({r.get('area_number')})".strip()
                 room = r.get("room_number")
+                status = r.get("fusion_status")
                 writer.writerow([
                     display_local(r.get("created_at"), tz_name),
                     _safe(r.get("caller_id")),
@@ -767,7 +914,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                     _safe(room if room is not None else ""),
                     _safe(r.get("tts_string")),
                     _safe(r.get("state")),
-                    r.get("fusion_status") if r.get("fusion_status") is not None else "",
+                    status if status is not None else "",
+                    display_local(r.get("created_at"), "UTC"),
+                    _safe(_fusion_result_text(status)),
                 ])
                 yield buf.getvalue()
                 buf.seek(0)

@@ -539,6 +539,22 @@ class CallDatabase:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_calls_between(self, start_epoch: float, end_epoch: float) -> list:
+        """#13-P1: read-only export of REAL calls (is_test=0) in [start, end].
+
+        Additive sibling of export_calls for a bounded date-range CSV export.
+        Mirrors export_calls' WHERE clause and ALWAYS appends 'AND is_test=0' so
+        dry-run/test rows can never leak. Inclusive on both bounds, newest-first.
+        Purely a SELECT — safe under the read-only dashboard's query_only=ON.
+        """
+        cursor = await self._db.execute(
+            "SELECT * FROM calls WHERE created_at >= ? AND created_at <= ? "
+            "AND is_test=0 ORDER BY created_at DESC",
+            (start_epoch, end_epoch),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def get_today_stats(self) -> dict:
         """State-aware counts for today's REAL calls (is_test=0).
 

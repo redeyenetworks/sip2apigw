@@ -236,6 +236,177 @@ class TestCsvExport:
         mock_db.export_calls.assert_awaited_once_with(today_only=True)
 
 
+    def test_export_has_utc_and_fusion_result_columns(self, client):
+        # #13-P1: header carries both a local and a UTC timestamp column plus a
+        # friendly Fusion Result column.
+        lines = client.get("/export.csv").text.splitlines()
+        header = lines[0]
+        assert "Time (local)" in header
+        assert "Time (UTC)" in header
+        assert "Fusion Result" in header
+
+    def test_export_friendly_fusion_result_delivered_and_rejected(self, client):
+        # SAMPLE_CALLS: row1 200 -> delivered, row2 500 -> FAILED (HTTP 500).
+        body = client.get("/export.csv").text
+        assert "delivered" in body
+        assert "FAILED (HTTP 500)" in body
+
+    def test_export_delivery_exception_minus_one(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], caller_id="excrow", fusion_status=-1)
+        mock_db.export_calls = AsyncMock(return_value=[row])
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        body = client.get("/export.csv").text
+        assert "FAILED (delivery exception)" in body
+
+    def test_export_pending_fusion_result(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], caller_id="pendrow", fusion_status=None)
+        mock_db.export_calls = AsyncMock(return_value=[row])
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        body = client.get("/export.csv").text
+        assert "pending" in body
+
+    def test_export_utf8_opens_clean(self, client):
+        # bytes decode as utf-8 without error
+        client.get("/export.csv").content.decode("utf-8")
+
+    def test_export_formula_injection_neutralized(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], caller_id="=cmd|'/c calc'!A0",
+                   tts_string="+SUM(A1)")
+        mock_db.export_calls = AsyncMock(return_value=[row])
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        body = client.get("/export.csv").text
+        # leading = / + neutralized with a leading apostrophe
+        assert "'=cmd" in body
+        assert "'+SUM(A1)" in body
+
+    def test_export_range_over_cap_is_400(self, client):
+        # end - start > 400 days must 400 BEFORE any query.
+        r = client.get("/export.csv?scope=range&start=0&end=99999999999")
+        assert r.status_code == 400
+
+    def test_export_range_missing_params_is_400(self, client):
+        assert client.get("/export.csv?scope=range").status_code == 400
+
+    def test_export_range_end_before_start_is_400(self, client):
+        r = client.get("/export.csv?scope=range&start=1000&end=500")
+        assert r.status_code == 400
+
+    def test_export_bogus_scope_falls_back_no_500(self, client):
+        r = client.get("/export.csv?scope=bananas")
+        assert r.status_code == 200
+        assert "text/csv" in r.headers["content-type"]
+
+    def test_export_valid_range_uses_get_calls_between(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], caller_id="RANGEROW")
+        mock_db.get_calls_between = AsyncMock(return_value=[row])
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        r = client.get("/export.csv?scope=range&start=1000&end=2000")
+        assert r.status_code == 200
+        assert "RANGEROW" in r.text
+        mock_db.get_calls_between.assert_awaited_once_with(1000.0, 2000.0)
+
+
+class TestPlainStatus:
+    def test_status_mapping_unit(self):
+        from sipgw.dashboard import _plain_status
+        for code, expected in [(200, "Delivered"), (204, "Delivered"),
+                               (-1, "NOT SENT - delivery failed"),
+                               (404, "NOT SENT - rejected"),
+                               (503, "NOT SENT - rejected"),
+                               (None, "Pending")]:
+            glyph, text, css = _plain_status(code)
+            assert text == expected
+            assert glyph            # non-empty glyph
+            assert css              # non-empty css class
+
+    def test_status_rendered_with_aria_label(self, client):
+        html = client.get("/").text
+        # 200 row -> Delivered with an aria-label (no colour-only signalling)
+        assert "Delivered" in html
+        assert 'aria-label="Delivery status: Delivered"' in html
+        # 500 row -> rejected
+        assert "NOT SENT - rejected" in html
+
+    def test_pending_status_when_null(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], fusion_status=None)
+        mock_db.get_calls_page = AsyncMock(return_value=([row], 1, 1))
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        html = client.get("/").text
+        assert 'aria-label="Delivery status: Pending"' in html
+
+    def test_delivery_exception_status_minus_one(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], fusion_status=-1)
+        mock_db.get_calls_page = AsyncMock(return_value=([row], 1, 1))
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        html = client.get("/").text
+        assert "NOT SENT - delivery failed" in html
+
+
+class TestTimeToggle:
+    def test_time_cell_has_data_epoch(self, client):
+        html = client.get("/").text
+        # data-epoch equals the row created_at (JSON-encoded numeric)
+        assert 'data-epoch="1708345800.0"' in html
+
+    def test_time_ctx_blob_parses_as_json(self, client):
+        import re, json
+        html = client.get("/").text
+        m = re.search(
+            r'<script id="sipgw-time-ctx" type="application/json">(.*?)</script>',
+            html, re.S)
+        assert m, "time-ctx blob missing"
+        ctx = json.loads(m.group(1))
+        assert "server_tz" in ctx
+        assert "ts_format" in ctx
+
+    def test_server_rendered_time_is_nojs_fallback(self, client):
+        # display_time (server string) remains as the no-JS fallback inside the cell
+        html = client.get("/").text
+        assert "2024-02" in html   # local render of the fixed epoch (1708345800)
+
+
+class TestXssSafety:
+    def test_script_in_fields_rendered_inert(self, mock_db, dashboard_config):
+        evil = dict(
+            SAMPLE_CALLS[0],
+            tts_string="<script>alert('tts')</script>",
+            display_name="<script>alert('name')</script>",
+        )
+        mock_db.get_calls_page = AsyncMock(return_value=([evil], 1, 1))
+        for view in ("summary", "advanced"):
+            client = TestClient(create_dashboard(mock_db, dashboard_config))
+            html = client.get(f"/?view={view}").text
+            assert "<script>alert('tts')</script>" not in html
+            assert "<script>alert('name')</script>" not in html
+            assert "&lt;script&gt;alert(&#39;tts&#39;)&lt;/script&gt;" in html
+
+
+@pytest.mark.asyncio
+async def test_get_calls_between_real_db(tmp_path):
+    """#13-P1: get_calls_between returns only is_test=0 rows within [start,end]."""
+    from sipgw.database import CallDatabase
+    db = CallDatabase(str(tmp_path / "r.db"))
+    await db.initialize()
+    import time as _t
+    now = _t.time()
+    # seed: one real row, one test row (both "now"); assert test row excluded
+    await db.create_pending_call(
+        caller_id="realrange", display_name="Code Blue", area_number="730",
+        area_name="E.D.", room_number="201", tts_string="Code Blue!", is_test=0)
+    await db.create_pending_call(
+        caller_id="testrange", display_name="Code Blue", area_number="730",
+        area_name="E.D.", room_number="202", tts_string="Code Blue!", is_test=1)
+    rows = await db.get_calls_between(now - 3600, now + 3600)
+    callers = {r["caller_id"] for r in rows}
+    assert "realrange" in callers
+    assert "testrange" not in callers
+    assert all(r["is_test"] == 0 for r in rows)
+    # a window that excludes the rows returns nothing
+    empty = await db.get_calls_between(0, 1000)
+    assert empty == []
+    await db.close()
+
+
 @pytest.mark.asyncio
 async def test_export_calls_db_excludes_is_test(tmp_path):
     """#13-P1: the real export_calls DB method enforces AND is_test=0."""
