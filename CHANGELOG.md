@@ -6,7 +6,9 @@ All notable changes to the sipgw project are documented in this file.
 
 ## [v1.6.1] — 2026-07-02
 
-Observability follow-up to #12. Log-file timestamps are now unambiguous.
+Backlog burn-down: a batch of **safe, additive, outage-free** observability + diagnostics
+improvements (no SIP/delivery behavior change, no dedupe enforcement). Closes **#9** and
+**#12**; advances **#5, #7, #11, #13, #15**.
 
 - **#12 log timestamps → UTC RFC3339 millis-Z.** All log streams (`sipgw.log`,
   `sipgw_api_debug.log`, `sipgw_sip_debug.log`, and the dashboard's own
@@ -33,6 +35,29 @@ Observability follow-up to #12. Log-file timestamps are now unambiguous.
   refuses to start prod. Warnings ride the existing `validate_config` warning
   loop, so both the gateway and the dashboard log them with no caller change.
   Completes #9 (the fatal-validation half shipped in v1.6.0).
+- **#11 full credential redaction (closes the masking sub-item).** `client_secret`
+  and `client_id` are now **fully** redacted in `api_debug` request logs (the prior
+  4-char prefix leak is gone). The BYE-before-ACK (481) teardown items remain open
+  as a separate SIP-state-machine change.
+- **#15 structured INVITE fingerprint line + upstream event-id extraction.** Each
+  inbound INVITE now logs a structured, greppable line carrying the retransmit-stable
+  transaction `fp=` plus a best-effort upstream `event_id` (Call-ID segment) — purely
+  additive telemetry, never touching routing/answer/BYE or the `on_call` callback.
+- **#5 richer SHADOW dedupe audit trail.** The (still-disabled) shadow detector's
+  `WOULD suppress` line now records the inter-page `gap`, `bed_match`/`purpose_match`,
+  and **both** Call-IDs, so the live duplicate-rate/gap evidence needed for the
+  clinical window decision is captured. Enforcement stays `validate_config`-forbidden;
+  a real second Code Blue is still always delivered.
+- **#7 enriched `/health` + additive Fusion reachability keepalive.** `/health` gains
+  informational fields (`backlog`, `last_delivered_at`, `fusion_reachable`,
+  `fusion_checked_age_s`); the **200/503 status stays driven solely by the writer
+  heartbeat** (no new failure flips it, so external monitors are unaffected). A
+  writer-side keepalive stamps Fusion reachability off the page path and is routed
+  through the no-send guard in dry-run (reaches no real host).
+- **#13 dashboard v2 Phase-1 remainder.** Time toggle (Local/UTC/Both), plain-language
+  + glyph + `aria-label` delivery status (WCAG, no colour-only signalling), a friendly
+  `Fusion Result` CSV column + UTC timestamp, and a read-only `get_calls_between` range
+  export. Dashboard-only (isolated read-only process); the epic's Phases 2–5 stay open.
 
 ## [v1.6.0] — 2026-07-01
 
