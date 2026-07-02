@@ -25,6 +25,9 @@ from .sip_message import (
     parse_sdp_connection,
     parse_sdp_media_port,
     invite_fingerprint,
+    invite_fingerprint_line,
+    parse_sdp_session_id,
+    extract_event_id,
 )
 from .rtp_handler import RTPSilenceStream
 from .config import AppConfig
@@ -54,6 +57,7 @@ class ActiveCall:
     transport: object = None
     protocol_type: str = "udp"
     fingerprint: str = ""          # #15 INVITE transaction fingerprint
+    event_id: str = ""             # #15 upstream event id (telemetry only)
     created_at: float = field(default_factory=time.time)
 
 
@@ -340,6 +344,15 @@ class SIPServer:
         remote_rtp_ip = parse_sdp_connection(msg.body) or addr[0]
         remote_rtp_port = parse_sdp_media_port(msg.body) or 0
 
+        # #15 additive observability: emit exactly ONE structured fingerprint
+        # line per NEW INVITE. Wrapped in its own guard so a telemetry failure
+        # can NEVER abort answering the INVITE (swallowed to debug).
+        try:
+            sdp_session = parse_sdp_session_id(msg.body)
+            logger.info(invite_fingerprint_line(msg, addr, remote_rtp_port, sdp_session))
+        except Exception:
+            logger.debug("INVITE fingerprint line failed", exc_info=True)
+
         # Allocate local RTP port
         try:
             local_rtp_port = self._allocate_rtp_port()
@@ -374,6 +387,7 @@ class SIPServer:
                 transport=transport,
                 protocol_type=protocol_type,
                 fingerprint=fingerprint,
+                event_id=extract_event_id(call_id),
             )
 
             self.calls[call_id] = call

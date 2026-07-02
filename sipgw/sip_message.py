@@ -105,6 +105,169 @@ def invite_fingerprint(msg: "SIPMessage") -> str:
     return f"{_FINGERPRINT_VERSION}:{digest}"
 
 
+def extract_event_id(call_id: str) -> str:
+    """Best-effort upstream event id from a Rauland Call-ID (segment 3).
+
+    Rauland Call-IDs look like ``<a>-<b>-<event>-<d>-0-13c4-764``; the third
+    hyphen-separated segment (index 2) is the upstream notification/event id
+    that stays constant across the duplicate/retransmitted INVITEs of one
+    clinical event. Returns "" for any shape that doesn't have at least three
+    segments. Never raises.
+
+    TELEMETRY / LOGGING ONLY. This value is emitted to the log and (optionally)
+    kept on the in-memory ActiveCall; it MUST NOT be consumed by any dedupe or
+    suppression decision — #5's clinical fingerprint (cf-v1:) is deliberately
+    separate and stays so.
+    """
+    try:
+        parts = (call_id or "").split("-")
+        if len(parts) >= 3:
+            return parts[2].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def parse_sdp_session_id(body: str) -> str:
+    """Extract the SDP session id from the o= line (field index 1).
+
+    ``o=<username> <sess-id> <sess-version> <nettype> <addrtype> <addr>`` — the
+    second whitespace-separated field is the session id. Best-effort: returns
+    "" when there is no usable o= line. Never raises.
+    """
+    try:
+        for line in (body or "").split("\n"):
+            line = line.strip()
+            if line.startswith("o="):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return parts[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def via_hosts(msg: "SIPMessage") -> List[str]:
+    """Ordered sent-by ``host[:port]`` list from the Via (or compact v) headers.
+
+    Returned top-to-bottom as the headers appear on the wire (topmost Via, added
+    by the most recent hop, first). Handles comma-folded multi-Via header values.
+    Best-effort and never raises — malformed Via entries are skipped.
+    """
+    hosts: List[str] = []
+    try:
+        vias = msg.get_headers("Via") or msg.get_headers("v")
+        for raw in vias:
+            for chunk in (raw or "").split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                # "SIP/2.0/UDP host[:port];branch=..." -> sent-by is token 1.
+                toks = chunk.split()
+                if len(toks) >= 2:
+                    sent_by = toks[1].split(";")[0].strip()
+                    if sent_by:
+                        hosts.append(sent_by)
+    except Exception:
+        pass
+    return hosts
+
+
+def _from_identity(from_hdr: str) -> Tuple[str, str, str]:
+    """(user, tag, display) from a From header — mirrors the parsing used by the
+    SIP server / transaction fingerprint, but self-contained here to avoid a
+    circular import. Best-effort; never raises.
+    """
+    user = tag = display = ""
+    try:
+        from_hdr = from_hdr or ""
+        dm = re.match(r'^\s*"([^"]*)"', from_hdr)
+        if dm:
+            display = dm.group(1)
+        else:
+            dm = re.match(r"^\s*([^<]*)<", from_hdr)
+            if dm:
+                display = dm.group(1).strip()
+        um = re.search(r"sip:([^@>;\s]+)", from_hdr)
+        if um:
+            user = um.group(1).strip()
+        tm = re.search(r";tag=([^;>\s]+)", from_hdr)
+        if tm:
+            tag = tm.group(1).strip()
+    except Exception:
+        pass
+    return user, tag, display
+
+
+def _logfmt_val(value) -> str:
+    """Render a value as a logfmt field value: bare when safe, quoted+escaped
+    when it contains whitespace, a quote, or '='. Newlines/tabs are collapsed to
+    spaces so one INVITE always maps to exactly one log line. Never raises.
+    """
+    try:
+        s = "" if value is None else str(value)
+    except Exception:
+        s = ""
+    if s == "" or any(c in s for c in ' \t\r\n"='):
+        s = (s.replace("\\", "\\\\").replace('"', '\\"')
+             .replace("\r", " ").replace("\n", " ").replace("\t", " "))
+        return f'"{s}"'
+    return s
+
+
+def invite_fingerprint_line(msg: "SIPMessage", addr, remote_rtp_port,
+                            sdp_session: str = "") -> str:
+    """Build ONE structured (logfmt) observability line for a NEW INVITE.
+
+    Purely additive telemetry (#15). Joins the shipped, retransmit-stable
+    transaction fingerprint (``fp=``) with per-INVITE identity fields so the
+    duplicate/retransmitted INVITEs of a single upstream event can be correlated
+    from the log alone:
+
+        INVITE fingerprint: call_id=.. event_id=.. from_tag=.. caller=.. \
+            display=.. src=.. via=<origin>..>us> sdp_session=.. rtp_port=.. fp=..
+
+    ``event_id`` is LOGGING ONLY (see ``extract_event_id``) and must never feed a
+    dedupe/suppression decision. The builder never raises: any internal failure
+    still yields a best-effort string so it can never abort answering an INVITE.
+    """
+    try:
+        call_id = (msg.get_call_id() or "").strip()
+    except Exception:
+        call_id = ""
+    try:
+        from_hdr = msg.get_from() or ""
+    except Exception:
+        from_hdr = ""
+    caller, from_tag, display = _from_identity(from_hdr)
+    event_id = extract_event_id(call_id)
+    try:
+        src = f"{addr[0]}:{addr[1]}"
+    except Exception:
+        src = ""
+    # Via is stored top-to-bottom (us-facing first); reverse to read origin>..>us.
+    via = ">".join(reversed(via_hosts(msg)))
+    try:
+        fp = invite_fingerprint(msg)
+    except Exception:
+        fp = ""
+    fields = [
+        ("call_id", call_id),
+        ("event_id", event_id),
+        ("from_tag", from_tag),
+        ("caller", caller),
+        ("display", display),
+        ("src", src),
+        ("via", via),
+        ("sdp_session", sdp_session or ""),
+        ("rtp_port", remote_rtp_port),
+        ("fp", fp),
+    ]
+    return "INVITE fingerprint: " + " ".join(
+        f"{k}={_logfmt_val(v)}" for k, v in fields
+    )
+
+
 def parse_sip_message(data: bytes) -> SIPMessage:
     """Parse raw bytes into a SIPMessage.
 
