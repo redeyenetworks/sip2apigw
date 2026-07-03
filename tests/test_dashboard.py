@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from sipgw.dashboard import create_dashboard
 from sipgw.database import CallDatabase
-from sipgw.config import DashboardConfig
+from sipgw.config import DashboardConfig, LoggingConfig
 
 SAMPLE_CALLS = [
     {
@@ -439,6 +439,210 @@ class TestEventId:
         mock_db.export_calls = AsyncMock(return_value=[row])
         client = TestClient(create_dashboard(mock_db, dashboard_config))
         assert "EVT7788" in client.get("/export.csv").text
+
+
+class TestCallDetail:
+    """#13 Phase-2 slice: GET /call/{id} correlated call-detail view."""
+
+    # A fixed instant so log-line stamps and created_at share a UTC local day.
+    import datetime as _dt
+    CREATED = _dt.datetime(2026, 7, 1, 18, 23, 45,
+                           tzinfo=_dt.timezone.utc).timestamp()
+    CID = "CID-MATCH-123"
+    OTHER = "CID-OTHER-999"
+    RULE = "=" * 72
+
+    def _row(self, **over):
+        row = {
+            "id": 303,
+            "caller_id": "a730r201",
+            "display_name": "Code Blue",
+            "area_number": 730,
+            "area_name": "1st Floor. E.D.",
+            "room_number": 201,
+            "tts_string": "Code Blue! 1st Floor. E.D. Room 201.",
+            "fusion_status": 200,
+            "response_time_ms": 150.0,
+            "created_at": self.CREATED,
+            "state": "delivered",
+            "attempts": 1,
+            "last_error": None,
+            "is_test": 0,
+            "sip_call_id": self.CID,
+        }
+        row.update(over)
+        return row
+
+    def _client(self, tmp_path, row, *, sip=True, api=True,
+                sip_log=None, main_log=None, api_log=None, archive_day=None):
+        log_dir = tmp_path
+        if sip_log is not None:
+            name = ("sipgw_sip_debug.log" if archive_day is None
+                    else f"sipgw_sip_debug.log.{archive_day}.tgz")
+            self._write(log_dir / name, sip_log, archive_day is not None)
+        if main_log is not None:
+            (log_dir / "sipgw.log").write_text(main_log)
+        if api_log is not None:
+            (log_dir / "sipgw_api_debug.log").write_text(api_log)
+        db = AsyncMock(spec=CallDatabase)
+        db.get_call = AsyncMock(return_value=row)
+        lc = LoggingConfig(log_dir=str(log_dir), timezone="UTC",
+                           sip_debug_log=sip, api_debug_log=api)
+        cfg = DashboardConfig(port=8080, bind_ip="0.0.0.0",
+                              auto_refresh_seconds=30, page_size=20)
+        return TestClient(create_dashboard(db, cfg, log_config=lc))
+
+    @staticmethod
+    def _write(path, text, compressed):
+        if not compressed:
+            path.write_text(text)
+            return
+        import tarfile, io
+        base = path.name[:-len(".tgz")].rsplit(".", 1)[0]  # sipgw_sip_debug.log
+        data = text.encode()
+        with tarfile.open(path, "w:gz") as tar:
+            info = tarfile.TarInfo(name=base)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    def _sip_log(self):
+        return (
+            f"2026-07-01T18:23:45.007Z [INFO] sipgw.sip_debug: <<< RECV from 10.0.0.5:5060 (udp)\n"
+            f"INVITE sip:1000@10.0.0.1 SIP/2.0\n"
+            f'From: "Code Blue" <sip:a730r201@10.0.0.5>;tag=abc\n'
+            f"Call-ID: {self.CID}\n"
+            f"CSeq: 1 INVITE\n"
+            f"2026-07-01T18:23:45.050Z [INFO] sipgw.sip_debug: >>> SEND to 10.0.0.5:5060 (udp)\n"
+            f"SIP/2.0 200 OK\n"
+            f"Call-ID: {self.CID}\n"
+            f"2026-07-01T18:24:10.100Z [INFO] sipgw.sip_debug: <<< RECV from 10.0.0.6:5060 (udp)\n"
+            f"INVITE sip:1000@10.0.0.1 SIP/2.0\n"
+            f"Call-ID: {self.OTHER}\n"
+        )
+
+    def _main_log(self):
+        return (
+            f"2026-07-01T18:23:45.010Z [INFO] sipgw.main: INVITE {self.CID} from a730r201\n"
+            f"2026-07-01T18:23:45.200Z [INFO] sipgw.main: Call {self.CID} recorded PENDING\n"
+            f"2026-07-01T18:23:46.000Z [ERROR] sipgw.delivery: delivery failed for {self.CID}: ConnectTimeout\n"
+            f"Traceback (most recent call last):\n"
+            f'  File "x.py", line 1, in <module>\n'
+            f"httpx.ConnectTimeout: timed out\n"
+            f"2026-07-01T18:24:11.000Z [INFO] sipgw.main: INVITE {self.OTHER} from someoneelse\n"
+        )
+
+    def _api_log(self, answer, n=1):
+        blk = (
+            f"2026-07-01T18:23:45.300Z [INFO] sipgw.api_debug: {self.RULE}\n"
+            f"2026-07-01T18:23:45.300Z [INFO] sipgw.api_debug: SCENARIO TRIGGER\n"
+            f"2026-07-01T18:23:45.300Z [INFO] sipgw.api_debug: {self.RULE}\n"
+            f"2026-07-01T18:23:45.300Z [INFO] sipgw.api_debug: REQUEST\n"
+            f'2026-07-01T18:23:45.300Z [INFO] sipgw.api_debug:   Body:    {{"fields": [{{"fieldId": "f", "answer": "{answer}"}}]}}\n'
+            f"2026-07-01T18:23:45.400Z [INFO] sipgw.api_debug: {'-' * 72}\n"
+        )
+        return blk * n
+
+    # --- exact SIP join --------------------------------------------------
+    def test_exact_sip_join_matches_only_callid(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log())
+        html = c.get("/call/303").text
+        assert "SIP/2.0 200 OK" in html          # the matching SEND block
+        assert self.CID in html
+        assert self.OTHER not in html             # the other call's block excluded
+
+    # --- main-log filter keeps continuation lines ------------------------
+    def test_main_log_filter_keeps_traceback(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log(),
+                         main_log=self._main_log())
+        html = c.get("/call/303").text
+        assert "recorded PENDING" in html
+        assert "httpx.ConnectTimeout: timed out" in html   # continuation kept
+        assert "Traceback (most recent call last)" in html
+        assert self.OTHER not in html                       # other call excluded
+
+    # --- legacy NULL sip_call_id -----------------------------------------
+    def test_legacy_null_callid_db_only(self, tmp_path):
+        c = self._client(tmp_path, self._row(sip_call_id=None, state="legacy"),
+                         sip_log=self._sip_log())
+        r = c.get("/call/303")
+        assert r.status_code == 200
+        assert "pre-#2 legacy row" in r.text
+        assert "SIP/2.0 200 OK" not in r.text     # no bogus SIP blocks
+
+    # --- unknown id / non-int -------------------------------------------
+    def test_unknown_id_404(self, tmp_path):
+        db = AsyncMock(spec=CallDatabase)
+        db.get_call = AsyncMock(return_value=None)
+        lc = LoggingConfig(log_dir=str(tmp_path), timezone="UTC")
+        cfg = DashboardConfig(port=8080, bind_ip="0.0.0.0",
+                              auto_refresh_seconds=30, page_size=20)
+        c = TestClient(create_dashboard(db, cfg, log_config=lc))
+        r = c.get("/call/999999")
+        assert r.status_code == 404
+        assert "not found" in r.text.lower()
+
+    def test_non_int_id_422(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log())
+        assert c.get("/call/abc").status_code == 422
+
+    # --- XSS: autoescape on --------------------------------------------
+    def test_xss_escaped(self, tmp_path):
+        evil = self._row(
+            display_name="<script>alert('n')</script>",
+            tts_string="<script>alert('t')</script>",
+            sip_call_id=None)
+        html = self._client(tmp_path, evil).get("/call/303").text
+        assert "<script>alert('n')</script>" not in html
+        assert "<script>alert('t')</script>" not in html
+        assert "&lt;script&gt;" in html
+
+    # --- archived .tgz day ----------------------------------------------
+    def test_archived_tgz_day(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log(),
+                         archive_day="2026-07-01")
+        html = c.get("/call/303").text
+        assert "SIP/2.0 200 OK" in html
+        assert self.CID in html
+
+    # --- sip debug disabled ---------------------------------------------
+    def test_sip_disabled_placeholder(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip=False,
+                         sip_log=self._sip_log())
+        html = c.get("/call/303").text
+        assert "SIP debug logging is disabled" in html
+        assert "SIP/2.0 200 OK" not in html
+
+    # --- api heuristic: both candidates on ambiguity --------------------
+    def test_api_heuristic_ambiguous_returns_all(self, tmp_path):
+        answer = "Code Blue! 1st Floor. E.D. Room 201."
+        c = self._client(tmp_path, self._row(),
+                         sip_log=self._sip_log(),
+                         api_log=self._api_log(answer, n=2))
+        html = c.get("/call/303").text
+        assert "Ambiguous: 2 blocks" in html
+        assert "provisional" in html.lower()
+
+    def test_api_heuristic_no_block_surfaced(self, tmp_path):
+        # A failed page that never reached Fusion: no matching api block.
+        c = self._client(tmp_path, self._row(fusion_status=-1),
+                         sip_log=self._sip_log(),
+                         api_log=self._api_log("SOME OTHER TTS"))
+        html = c.get("/call/303").text
+        assert "No API delivery block found" in html
+
+    # --- [TEST] badge ----------------------------------------------------
+    def test_test_row_badge(self, tmp_path):
+        c = self._client(tmp_path, self._row(is_test=1),
+                         sip_log=self._sip_log())
+        html = c.get("/call/303").text
+        assert "[TEST]" in html
+
+    # --- table rows link to /call/{id} -----------------------------------
+    def test_table_rows_link_to_detail(self, client):
+        # The call table's time cell links to the deep-linkable detail page,
+        # carrying a ?from= snapshot of the current table state.
+        html = client.get("/").text
+        assert 'href="/call/1?from=' in html
 
 
 @pytest.mark.asyncio

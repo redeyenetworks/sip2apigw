@@ -521,7 +521,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% if calls %}
                 {% for call in calls %}
                 <tr>
-                    <td class="time-cell" data-epoch="{{ call.created_at | tojson }}">{{ call.display_time }}</td>
+                    <td class="time-cell" data-epoch="{{ call.created_at | tojson }}"><a href="/call/{{ call.id }}?from={{ from_param }}">{{ call.display_time }}</a></td>
                     <td>{{ call.caller_id }}</td>
                     <td>{{ call.display_name }}</td>
                     <td>{{ call.area_name }}{% if call.area_number %} ({{ call.area_number }}){% endif %}</td>
@@ -776,6 +776,115 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
+
+
+# #13 Phase-2 slice: correlated single-call detail page. Rendered through the
+# same env = Environment(autoescape=True) as DASHBOARD_HTML — SIP From
+# display-names and the TTS string are attacker-adjacent, so autoescape MUST
+# stay on. Self-contained (no external JS/CDN); numbers/paths/escaped text only.
+CALL_DETAIL_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Call #{{ call.id }} &middot; sipgw</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+               background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
+        a { color: #4fc3f7; }
+        .back { display: inline-block; margin-bottom: 16px; text-decoration: none; }
+        h1 { font-size: 1.3rem; margin: 0 0 4px 0; }
+        h2 { font-size: 1.05rem; margin: 28px 0 8px 0; color: #e6edf3; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                padding: 16px; margin-bottom: 8px; }
+        .grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; }
+        .grid dt { color: #8b949e; }
+        .grid dd { margin: 0; }
+        .badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
+                 font-size: 0.75rem; font-weight: 600; }
+        .badge-test { background: #6e2a00; color: #ffb37a; margin-left: 8px; }
+        .pill { display: inline-block; padding: 2px 10px; border-radius: 10px; font-weight: 600; }
+        .status-ok { background: #12341c; color: #6fdc8c; }
+        .status-err { background: #3a1418; color: #ff8088; }
+        .status-pending { background: #33290a; color: #e3b341; }
+        .note { color: #8b949e; font-style: italic; padding: 8px 0; }
+        .heuristic { color: #e3b341; font-weight: 600; }
+        pre { background: #010409; border: 1px solid #30363d; border-radius: 6px;
+              padding: 12px; font-size: 0.78rem; line-height: 1.45; overflow-x: auto;
+              white-space: pre-wrap; word-wrap: break-word; color: #adbac7; }
+        .blk { margin-bottom: 10px; }
+        .blk-hdr { color: #8b949e; font-size: 0.75rem; margin-bottom: 2px; }
+    </style>
+</head>
+<body>
+    <a class="back" href="{{ back_href }}">&laquo; Back to all calls</a>
+    <h1>Call #{{ call.id }}
+        {% if is_test %}<span class="badge badge-test">[TEST]</span>{% endif %}
+    </h1>
+    <div class="card">
+        <dl class="grid">
+            <dt>Time ({{ tz_label }})</dt><dd>{{ display_time }}</dd>
+            <dt>Caller ID</dt><dd>{{ call.caller_id }}</dd>
+            <dt>Display Name</dt><dd>{{ call.display_name }}</dd>
+            <dt>Area</dt><dd>{{ call.area_name }}{% if call.area_number %} ({{ call.area_number }}){% endif %}</dd>
+            <dt>Room</dt><dd>{{ call.room_number if call.room_number is not none else '-' }}</dd>
+            <dt>TTS String</dt><dd>{{ call.tts_string }}</dd>
+            <dt>Delivery</dt><dd><span class="pill {{ status_class }}">{{ status_glyph }} {{ status_text }}</span></dd>
+            <dt>State</dt><dd>{{ call.state if call.state else '-' }}</dd>
+            <dt>Call-ID</dt><dd>{{ sip_call_id if sip_call_id else '(none recorded)' }}</dd>
+        </dl>
+    </div>
+
+    <h2>SIP messages</h2>
+    {% if not sip_call_id %}
+        <div class="note">No Call-ID recorded (pre-#2 legacy row); DB record only &mdash; no SIP correlation possible.</div>
+    {% elif sip_disabled %}
+        <div class="note">SIP debug logging is disabled; no raw SIP messages captured.</div>
+    {% elif not sip_blocks %}
+        <div class="note">No SIP messages found for this Call-ID (logs may have been rotated out / retention expired).</div>
+    {% else %}
+        {% for blk in sip_blocks %}
+        <div class="blk"><pre>{% for line in blk.lines %}{{ line }}
+{% endfor %}</pre></div>
+        {% endfor %}
+    {% endif %}
+
+    <h2>Main log</h2>
+    {% if not sip_call_id %}
+        <div class="note">No Call-ID recorded; DB record only.</div>
+    {% elif not main_lines %}
+        <div class="note">No main-log lines reference this Call-ID (logs may have been rotated out / retention expired).</div>
+    {% else %}
+        <pre>{% for line in main_lines %}{{ line }}
+{% endfor %}</pre>
+    {% endif %}
+
+    <h2>Fusion API delivery <span class="heuristic">(provisional / heuristic)</span></h2>
+    {% if api_disabled %}
+        <div class="note">API debug logging is disabled; no Fusion API exchange captured.</div>
+    {% elif not api_candidates %}
+        <div class="note">No API delivery block found (matched heuristically by TTS text; absence is expected for a failed page that never reached Fusion).</div>
+    {% else %}
+        {% if api_candidates|length > 1 %}
+        <div class="heuristic">Ambiguous: {{ api_candidates|length }} blocks match this TTS in the time window &mdash; all shown, none assumed.</div>
+        {% endif %}
+        <div class="note">Correlated by TTS 'answer' text + time window (this stream carries no Call-ID). Treat as provisional.</div>
+        {% for blk in api_candidates %}
+        <div class="blk"><pre>{% for line in blk.lines %}{{ line }}
+{% endfor %}</pre></div>
+        {% endfor %}
+    {% endif %}
+</body>
+</html>"""
+
+
+CALL_NOT_FOUND_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Call not found &middot; sipgw</title>
+<style>body { font-family: -apple-system, sans-serif; background: #0d1117; color: #c9d1d9;
+padding: 40px; } a { color: #4fc3f7; }</style></head>
+<body><h1>Call #{{ call_id }} not found</h1>
+<p>No call with that id exists in this database.</p>
+<a href="{{ back_href }}">&laquo; Back to all calls</a></body></html>"""
 
 
 SAMPLE_LOOKUPS_YAML = """\
@@ -1121,6 +1230,156 @@ def _read_log_for_day(log_dir: str, base: str, local_date: str, tzname: str,
     return out[-num_lines:]
 
 
+# ---------------------------------------------------------------------------
+# #13 Phase-2 slice: /call/{id} correlation helpers.
+#
+# All read-only, run in the standalone dashboard process (never the SIP writer).
+# The AUTHORITATIVE correlation key is the DB row's sip_call_id (written by #2,
+# main.py) which equals the SIP Call-ID header, so the SIP-log join is an EXACT
+# match (no fragile order-preserving bridge). The api_debug join is explicitly
+# a labelled HEURISTIC (that stream carries no Call-ID).
+# ---------------------------------------------------------------------------
+
+_SIP_CALLID_RE = re.compile(r"^Call-ID:\s*(\S+)", re.IGNORECASE)
+_API_RULE = "=" * 72
+# A big per-day tail so a whole day's blocks for one call are captured (a single
+# call is a handful of lines; the int {id} route reads only its own archives).
+_CORR_MAX_LINES = 500000
+
+
+def _local_day_str(epoch: float, tzname: str) -> str:
+    """YYYY-MM-DD of an epoch in the display zone."""
+    return datetime.fromtimestamp(epoch, _resolve_tz(tzname)).strftime("%Y-%m-%d")
+
+
+def _neighbor_days(epoch: float, tzname: str) -> list:
+    """The call's local day plus the two neighbours, to cover a call whose SIP
+    traffic straddles a LOCAL midnight. Exact Call-ID filtering keeps this
+    lossless (Call-IDs are unique, so extra days never add false matches)."""
+    days = []
+    for delta in (-86400, 0, 86400):
+        d = _local_day_str(epoch + delta, tzname)
+        if d not in days:
+            days.append(d)
+    return days
+
+
+def _parse_sip_blocks(lines: list) -> list:
+    """Split raw sip_debug lines into SIP message blocks at each
+    '>>> SEND to' / '<<< RECV from' marker line. Each block spans [marker ..
+    next marker) and records the first Call-ID header it carries. Lines before
+    the first marker (none in practice) are ignored. Never raises."""
+    blocks, cur = [], None
+    for ln in lines:
+        if ">>> SEND to" in ln or "<<< RECV from" in ln:
+            cur = {"callid": None, "lines": []}
+            blocks.append(cur)
+        if cur is None:
+            continue
+        cur["lines"].append(ln)
+        if cur["callid"] is None:
+            m = _SIP_CALLID_RE.match(ln.lstrip())
+            if m:
+                cur["callid"] = m.group(1)
+    return blocks
+
+
+def _sip_blocks_for_callid(log_dir: str, cid: str, created_epoch: float,
+                           tzname: str) -> list:
+    """EXACT: SIP blocks whose Call-ID header equals cid, across the call's
+    local day and neighbours. Returns [] when cid is falsy or nothing matches."""
+    if not cid:
+        return []
+    out, seen = [], set()
+    for day in _neighbor_days(created_epoch, tzname):
+        lines = _read_log_for_day(log_dir, "sipgw_sip_debug.log", day, tzname,
+                                  num_lines=_CORR_MAX_LINES)
+        for blk in _parse_sip_blocks(lines):
+            if blk["callid"] == cid:
+                key = tuple(blk["lines"])
+                if key not in seen:
+                    seen.add(key)
+                    out.append(blk)
+    return out
+
+
+def _main_lines_for_callid(log_dir: str, cid: str, created_epoch: float,
+                           tzname: str) -> list:
+    """Main-log (sipgw.log) lines that reference the Call-ID token. A
+    continuation/traceback line (no leading timestamp) inherits the keep state
+    of its parent line, so ConnectTimeout tracebacks are never dropped."""
+    if not cid:
+        return []
+    out = []
+    for day in _neighbor_days(created_epoch, tzname):
+        lines = _read_log_for_day(log_dir, "sipgw.log", day, tzname,
+                                  num_lines=_CORR_MAX_LINES)
+        keep = False
+        for ln in lines:
+            if _line_epoch(ln) is not None:
+                keep = cid in ln
+            if keep:
+                out.append(ln)
+    return out
+
+
+def _parse_api_blocks(lines: list) -> list:
+    """Split api_debug lines into request/response blocks. Each block opens with
+    a 3-line header ('='*72, LABEL, '='*72) emitted by webhook._log_request; a
+    block runs until the next such header. Records the block's first timestamp.
+    Uses look-ahead on the header triple so the second rule of the pair never
+    opens a spurious block."""
+    blocks, cur = [], None
+    n, i = len(lines), 0
+    while i < n:
+        is_header = (
+            _API_RULE in lines[i]
+            and i + 2 < n
+            and _API_RULE not in lines[i + 1]
+            and _API_RULE in lines[i + 2]
+        )
+        if is_header:
+            cur = {"lines": [], "epoch": None}
+            blocks.append(cur)
+            for j in (i, i + 1, i + 2):
+                cur["lines"].append(lines[j])
+                if cur["epoch"] is None:
+                    ep = _line_epoch(lines[j])
+                    if ep is not None:
+                        cur["epoch"] = ep
+            i += 3
+            continue
+        if cur is not None:
+            cur["lines"].append(lines[i])
+            if cur["epoch"] is None:
+                ep = _line_epoch(lines[i])
+                if ep is not None:
+                    cur["epoch"] = ep
+        i += 1
+    return blocks
+
+
+def _api_heuristic(log_dir: str, tts: str, created_epoch: float,
+                   tzname: str, window: float = 180.0) -> list:
+    """HEURISTIC / provisional: api_debug carries no Call-ID, so a page's Fusion
+    exchange is matched by its TTS 'answer' body within +/- window seconds of
+    created_at. Returns ALL candidates on ambiguity (never guesses one); [] when
+    tts is falsy or nothing matches (absence is surfaced by the caller, not an
+    error)."""
+    if not tts:
+        return []
+    out = []
+    for day in _neighbor_days(created_epoch, tzname):
+        lines = _read_log_for_day(log_dir, "sipgw_api_debug.log", day, tzname,
+                                  num_lines=_CORR_MAX_LINES)
+        for blk in _parse_api_blocks(lines):
+            if tts in "\n".join(blk["lines"]):
+                ep = blk["epoch"]
+                if ep is None or abs(ep - created_epoch) <= window:
+                    out.append(blk)
+    return out
+
+
 def create_dashboard(db: CallDatabase, config: DashboardConfig,
                      log_config: Optional[LoggingConfig] = None,
                      health_config=None) -> FastAPI:
@@ -1130,6 +1389,8 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
     app = FastAPI(title="sipgw Dashboard", docs_url=None, redoc_url=None)
     env = Environment(autoescape=True)
     template = env.from_string(DASHBOARD_HTML)
+    detail_template = env.from_string(CALL_DETAIL_HTML)        # #13 Phase-2 slice
+    notfound_template = env.from_string(CALL_NOT_FOUND_HTML)   # #13 Phase-2 slice
 
     log_dir = Path(log_config.log_dir) if log_config else Path("/var/log/sipgw")
     log_file = str(log_dir / "sipgw.log")
@@ -1271,8 +1532,18 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         if refresh not in (10, 30, 60, 120, 300):
             refresh = config.auto_refresh_seconds
 
+        # #13 Phase-2 slice: a doubly-encoded snapshot of the current table state
+        # so each row's /call/{id} link can offer an exact "Back to all calls".
+        from urllib.parse import urlencode, quote
+        _inner = {"page": page, "view": view,
+                  "auto": "1" if auto else "0", "refresh": refresh}
+        if selected_date and not is_live:
+            _inner["logdate"] = selected_date
+        from_param = quote(urlencode(_inner), safe="")
+
         html = template.render(
             calls=calls,
+            from_param=from_param,
             total_calls=total_calls,
             success_calls=success,
             failed_calls=failed,
@@ -1293,6 +1564,69 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             tz_label=tz_label,
             time_ctx=_time_context(log_config),
             chart=chart,
+        )
+        return HTMLResponse(content=html)
+
+    @app.get("/call/{call_id}", response_class=HTMLResponse)
+    async def call_detail(
+        call_id: int,
+        from_: Optional[str] = Query(None, alias="from"),
+    ):
+        """#13 Phase-2 slice: correlated single-call detail view.
+
+        Read-only, zero SIP-path code. The DB row's sip_call_id (written by #2)
+        is the AUTHORITATIVE key: the SIP-log and main-log joins are EXACT
+        Call-ID matches; the api_debug panel is a clearly-labelled heuristic.
+        Unknown id -> 404 (never 500); a non-int path -> FastAPI 422. A [TEST]
+        row (is_test=1) is shown read-only but badged, never silently excluded.
+        """
+        tz_name = log_config.timezone if log_config else ""
+        # Preserve the caller's table state for "Back to all calls"; default "/".
+        back_href = ("/?" + from_) if from_ else "/"
+
+        try:
+            call = await db.get_call(call_id)
+        except Exception:
+            logger.exception("call_detail: get_call(%s) failed", call_id)
+            call = None
+        if not call:
+            html = notfound_template.render(call_id=call_id, back_href=back_href)
+            return HTMLResponse(content=html, status_code=404)
+
+        created = call.get("created_at")
+        cid = call.get("sip_call_id")
+        glyph, text, css = _plain_status(call.get("fusion_status"))
+
+        sip_blocks = main_lines = api_candidates = None
+        if cid and isinstance(created, (int, float)):
+            try:
+                if sip_debug_enabled:
+                    sip_blocks = _sip_blocks_for_callid(
+                        str(log_dir), cid, created, tz_name)
+                main_lines = _main_lines_for_callid(
+                    str(log_dir), cid, created, tz_name)
+                if api_debug_enabled:
+                    api_candidates = _api_heuristic(
+                        str(log_dir), call.get("tts_string") or "", created, tz_name)
+            except Exception:
+                logger.exception(
+                    "call_detail: log correlation failed for call %s", call_id)
+
+        html = detail_template.render(
+            call=call,
+            display_time=display_local(created, tz_name),
+            status_glyph=glyph,
+            status_text=text,
+            status_class=css,
+            is_test=bool(call.get("is_test")),
+            sip_call_id=cid,
+            sip_blocks=sip_blocks,
+            sip_disabled=not sip_debug_enabled,
+            main_lines=main_lines,
+            api_candidates=api_candidates,
+            api_disabled=not api_debug_enabled,
+            tz_label=str(_resolve_tz(tz_name)),
+            back_href=back_href,
         )
         return HTMLResponse(content=html)
 
