@@ -338,7 +338,7 @@ class TestFindRecentDuplicateReturn:
 
 
 # --------------------------------------------------------------- validate_config
-class TestValidateConfigEnforceForbidden:
+class TestValidateConfigEnforce:
     def _prod_ok(self) -> AppConfig:
         c = AppConfig()
         c.fusion = FusionConfig(
@@ -349,20 +349,22 @@ class TestValidateConfigEnforceForbidden:
         c.escalation.webhook_url = "https://hooks.example.com/escalation"
         return c
 
-    def test_enforce_true_is_fatal(self):
+    def test_enforce_true_warns_active_not_fatal(self):
+        # Enforcement is clinically signed off — enforce=True is no longer fatal;
+        # it emits a loud SUPPRESSION ACTIVE warning instead (never a ConfigError).
         c = self._prod_ok()
         c.dedupe.enforce = True
-        with pytest.raises(ConfigError) as ei:
-            validate_config(c, dry_run=False)
-        assert "dedupe.enforce" in str(ei.value)
+        c.dedupe.window_seconds = 2
+        w = validate_config(c, dry_run=False)
+        assert any("SUPPRESSION ACTIVE" in x for x in w)
 
-    def test_enforce_true_is_fatal_even_in_dry_run(self):
+    def test_enforce_true_dry_run_warns_not_fatal(self):
         c = AppConfig()
         c.fusion.dry_run = True
         c.dedupe.enforce = True
-        with pytest.raises(ConfigError) as ei:
-            validate_config(c, dry_run=True)
-        assert "dedupe.enforce" in str(ei.value)
+        c.dedupe.window_seconds = 2
+        w = validate_config(c, dry_run=True)
+        assert any("SUPPRESSION ACTIVE" in x for x in w)
 
     def test_enforce_false_is_ok(self):
         c = self._prod_ok()

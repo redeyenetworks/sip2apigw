@@ -157,6 +157,7 @@ STATE_DELIVERED = "delivered"
 STATE_FAILED = "failed"
 STATE_EXPIRED = "expired"
 STATE_LEGACY = "legacy"
+STATE_DUPLICATE = "duplicate"   # #5 enforcement: suppressed (recorded, NOT delivered)
 
 
 class CallDatabase:
@@ -481,6 +482,23 @@ class CallDatabase:
         await self._db.execute(
             "UPDATE calls SET duplicate_of=? WHERE id=?", (duplicate_of, call_id))
         await self._db.commit()
+
+    async def mark_suppressed(self, call_id: int, duplicate_of: int) -> int:
+        """#5 ENFORCEMENT: transition a still-PENDING page to ``duplicate`` so the
+        delivery worker (which selects state='pending') never sends it — the page
+        is SUPPRESSED but stays a durable audit row (record-first preserved).
+
+        Guarded on state='pending': if the worker already grabbed it (state moved
+        to 'delivering'/'delivered'), this is a no-op (rowcount 0) and the page is
+        delivered — the fail-SAFE direction (deliver a duplicate rather than drop a
+        real page). Returns rowcount (1 = suppressed, 0 = already in flight).
+        """
+        cur = await self._db.execute(
+            "UPDATE calls SET state=?, duplicate_of=?, delivered_at=NULL "
+            "WHERE id=? AND state=?",
+            (STATE_DUPLICATE, duplicate_of, call_id, STATE_PENDING))
+        await self._db.commit()
+        return cur.rowcount
 
     async def get_call(self, call_id: int) -> Optional[Dict[str, Any]]:
         cur = await self._db.execute("SELECT * FROM calls WHERE id=?", (call_id,))

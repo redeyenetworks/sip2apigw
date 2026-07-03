@@ -28,6 +28,20 @@ Behavioral SIP change — **writer restart** (brief ~0.3s SIP blip); no dashboar
   production (`immediate_bye: true`) and a new **host drill M7** gates the deploy:
   INVITE→200→ACK→BYE with zero 481 / zero "ACK for unknown call", plus the lost-ACK
   fallback path.
+- **#5 clinical dedupe SUPPRESSION enabled (closes #5).** After clinical sign-off,
+  `dedupe.enforce` is no longer a fatal config — it is enabled in production with the
+  **safest** parameters: `window_seconds: 2` (only near-instant duplicates; a re-page
+  >2s later is treated as legitimate and always delivered), **bed-level** (`match_bed:
+  true`, so two patients coding in one room are never merged), and purpose in the key
+  (RRT and Code Blue never merge). A suppressed page is **still recorded** (record-first:
+  it becomes a durable `duplicate` audit row pointing at the original), it is simply not
+  delivered. Suppression is **fail-safe**: it is guarded on `state='pending'`, so if the
+  delivery worker has already picked the page up, the page is delivered rather than
+  dropped — every race resolves toward *delivery*, never a wrongful drop. `validate_config`
+  now WARNS loudly (`*** DEDUPE SUPPRESSION ACTIVE ***`) instead of refusing to start, and
+  flags an inert (`window<=0`) or wide (`window>10s`) window. **Kill-switch:**
+  `dedupe.enforce=false` + restart. A new host drill **M8** gates the deploy (two same-bed
+  pages <2s → one suppressed; >2s → both delivered).
 
 ## [v1.6.5] — 2026-07-03
 

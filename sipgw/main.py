@@ -213,7 +213,23 @@ class SIPGateway:
                 sip_call_id=call_id,   # #5 telemetry: log the current page's Call-ID too
                 event_id=event_id or None,   # #5 shadow annotation only (never a match key)
             )
-            if decision.duplicate_of is not None:
+            if decision.suppress:
+                # #5 ENFORCEMENT: the page is a clinical duplicate within the
+                # window. It was already recorded (record-first); transition it to
+                # 'duplicate' so the worker never delivers it. mark_suppressed is
+                # guarded on state='pending', so if the worker already grabbed it
+                # the row is delivered — the fail-SAFE direction.
+                suppressed = await self.db.mark_suppressed(row_id, decision.duplicate_of)
+                if suppressed:
+                    logger.warning(
+                        "SUPPRESSED duplicate page: Call %s (row %s) is a clinical "
+                        "duplicate of row %s (fp=%s) — NOT delivered (enforcement)",
+                        call_id, row_id, decision.duplicate_of, decision.fingerprint)
+                else:
+                    logger.warning(
+                        "dedupe: row %s already in delivery when suppression fired "
+                        "— delivering anyway (fail-safe)", row_id)
+            elif decision.duplicate_of is not None:
                 await self.db.record_duplicate_of(row_id, decision.duplicate_of)
                 logger.info(
                     "Call %s (row %s) is a clinical duplicate of row %s "

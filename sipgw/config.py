@@ -307,13 +307,25 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
         warnings.append("escalation.webhook_url is not set — failed/expired pages "
                         "will be logged but not escalated to a human channel")
 
-    # #5 clinical dedupe enforcement is not approved for production use — a
-    # suppressed page is a missed Code Blue. It requires clinical sign-off and
-    # is forbidden today in ALL modes (dry-run included). Shadow-only.
+    # #5 clinical dedupe enforcement. Suppressing a page IS dropping a Code Blue,
+    # so this is clinically gated — but once signed off, it is enabled here, never
+    # silently. It is never fatal (that would take down paging over a config nit);
+    # instead we WARN loudly so the state is unmistakable in the startup log.
     if config.dedupe.enforce:
-        errors.append(
-            "dedupe.enforce must be False — clinical dedupe SUPPRESSION is not "
-            "approved (requires clinical sign-off); ships SHADOW only")
+        if config.dedupe.window_seconds <= 0:
+            warnings.append(
+                "dedupe.enforce=true but window_seconds<=0 — suppression is INERT "
+                "(no page is ever suppressed); set window_seconds>0 to activate")
+        else:
+            warnings.append(
+                f"*** DEDUPE SUPPRESSION ACTIVE *** a repeat page for the same "
+                f"{'bed' if config.dedupe.match_bed else 'room'}+purpose within "
+                f"{config.dedupe.window_seconds}s will be DROPPED (not delivered). "
+                f"Clinically signed off. Kill-switch: dedupe.enforce=false + restart.")
+            if config.dedupe.window_seconds > 10:
+                warnings.append(
+                    f"dedupe.window_seconds={config.dedupe.window_seconds} is wide "
+                    f"— a legitimate re-page within that window would be dropped")
 
     if not (1 <= config.dashboard.port <= 65535):
         errors.append(f"dashboard.port out of range: {config.dashboard.port}")
