@@ -20,7 +20,11 @@ from typing import Optional
 
 from datetime import datetime, timezone as _tz, timedelta, date as _date
 
-from .database import CallDatabase, display_local, _resolve_tz
+from .database import (
+    CallDatabase, display_local, _resolve_tz,
+    STATE_DELIVERED, STATE_FAILED, STATE_EXPIRED, STATE_PENDING,
+    STATE_DELIVERING, STATE_LEGACY, STATE_DUPLICATE,
+)
 from .config import DashboardConfig, LoggingConfig
 from .lookups import get_call_purpose
 
@@ -54,6 +58,63 @@ def _format_age(seconds: float) -> str:
     if s < 172800:          # < 48 h
         return f"{int(s / 3600)}h"
     return f"{int(s / 86400)}d"
+
+
+def _relative_age(seconds: float) -> str:
+    """F3b: spoken relative age for the last-call banner (server no-JS fallback).
+
+    e.g. 'just now', '3 minutes ago', '3 hours ago', '2 days ago'. The client
+    re-renders the same idea from the element's data-epoch; this is the fallback.
+    """
+    s = max(0.0, float(seconds))
+    if s < 45:
+        return "just now"
+    if s < 3600:            # < 60 min -> minutes
+        m = max(1, int(s / 60))
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    if s < 172800:          # < 48 h -> hours
+        h = int(s / 3600)
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    d = int(s / 86400)
+    return f"{d} day{'s' if d != 1 else ''} ago"
+
+
+def _stats_from_rows(rows) -> dict:
+    """F3a: classify a list of REAL (is_test=0) call rows into Today-view counts.
+
+    Mirrors db.get_today_stats' classification exactly so a HISTORICAL day
+    (computed in Python from the day_rows already fetched via get_calls_between)
+    reports the same success/failed/pending/suppressed semantics as the live day:
+      success   = delivered (+ legacy rows with a 2xx fusion_status)
+      failed    = failed + expired (+ legacy rows with a non-2xx/NULL fusion_status)
+      pending   = pending + delivering
+      suppressed= duplicate (#5 clinical-dedupe suppression)
+    """
+    by_state: dict = {}
+    legacy_ok = 0
+    legacy_bad = 0
+    for r in rows:
+        state = r.get("state") or STATE_LEGACY
+        by_state[state] = by_state.get(state, 0) + 1
+        if state == STATE_LEGACY:
+            fs = r.get("fusion_status")
+            try:
+                code = int(fs)
+            except (TypeError, ValueError):
+                code = None
+            if code is not None and 200 <= code < 300:
+                legacy_ok += 1
+            else:
+                legacy_bad += 1
+    return {
+        "success": by_state.get(STATE_DELIVERED, 0) + legacy_ok,
+        "failed": (by_state.get(STATE_FAILED, 0)
+                   + by_state.get(STATE_EXPIRED, 0) + legacy_bad),
+        "pending": (by_state.get(STATE_PENDING, 0)
+                    + by_state.get(STATE_DELIVERING, 0)),
+        "suppressed": by_state.get(STATE_DUPLICATE, 0),
+        "by_state": by_state,
+    }
 
 
 def _plain_status(fusion_status) -> tuple:
@@ -287,6 +348,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .stat-card .label { color: #888; font-size: 0.8rem; }
         .stat-card .value { color: #00d4ff; font-size: 1.5rem; font-weight: bold; }
+        .today-view {
+            border: 1px solid #0f3460;
+            border-radius: 10px;
+            padding: 15px 18px 5px 18px;
+            margin-bottom: 20px;
+            background: #121a33;
+        }
+        .today-head {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+        .today-title { color: #00d4ff; font-size: 1.1rem; margin: 0; }
+        .today-title .today-scope { color: #ffcc80; font-weight: normal; font-size: 0.8rem; }
+        .last-call-banner {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-left: 3px solid #4fc3f7;
+            border-radius: 6px;
+            padding: 8px 14px;
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+            color: #cfd8ea;
+        }
+        .last-call-banner .last-call-label { color: #888; margin-right: 8px; }
+        .last-call-banner .last-call-time { color: #e8eefc; font-weight: 600; }
+        .last-call-banner .last-call-age { color: #6ee7a8; margin-left: 8px; }
+        .last-call-banner .last-call-ctx { color: #9aa7c7; margin-left: 8px; }
+        .last-call-banner.empty .last-call-time { color: #888; font-weight: normal; }
         table {
             width: 100%;
             border-collapse: collapse;
@@ -480,28 +571,48 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         {% if not is_live %}<a class="date-bar-today" href="/">&#8635; Back to today</a>{% endif %}
     </div>
 
-    <div class="stats">
-        <div class="stat-card">
-            <div class="label">Today's Calls</div>
-            <div class="value">{{ total_calls }}</div>
+    <section class="today-view">
+        <div class="today-head">
+            <h2 class="today-title">{% if is_live %}Today{% else %}{{ selected_date }} <span class="today-scope">(historical)</span>{% endif %}</h2>
         </div>
-        <div class="stat-card">
-            <div class="label">Successful</div>
-            <div class="value" style="color: #4caf50;">{{ success_calls }}</div>
+
+        {% if last_call %}
+        <div class="last-call-banner" id="lastCallBanner">
+            <span class="last-call-label">Last call from Rauland</span>
+            <span class="last-call-time" data-epoch="{{ last_call.created_at | tojson }}">{{ last_call.display_local }}</span>
+            <span class="last-call-age" data-epoch="{{ last_call.created_at | tojson }}">({{ last_call.age_label }})</span>
+            {% if last_call.context %}<span class="last-call-ctx">&mdash; {{ last_call.context }}</span>{% endif %}
         </div>
-        <div class="stat-card">
-            <div class="label">Failed</div>
-            <div class="value" style="color: #f44336;">{{ failed_calls }}</div>
+        {% else %}
+        <div class="last-call-banner empty" id="lastCallBanner">
+            <span class="last-call-label">Last call from Rauland</span>
+            <span class="last-call-time">No calls on record.</span>
         </div>
-        <div class="stat-card">
-            <div class="label">Pending</div>
-            <div class="value" style="color: #ff9800;">{{ pending_calls }}</div>
+        {% endif %}
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="label">{% if is_live %}Today's Calls{% else %}Calls{% endif %}</div>
+                <div class="value">{{ total_calls }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Successful</div>
+                <div class="value" style="color: #4caf50;">{{ success_calls }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Failed</div>
+                <div class="value" style="color: #f44336;">{{ failed_calls }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Pending</div>
+                <div class="value" style="color: #ff9800;">{{ pending_calls }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Suppressed (dup)</div>
+                <div class="value" style="color: #9c8cff;">{{ suppressed_calls }}</div>
+            </div>
         </div>
-        <div class="stat-card">
-            <div class="label">Last inbound from Rauland</div>
-            <div class="value" style="color: {{ inbound_color }};">{{ inbound_age_label }}</div>
-        </div>
-    </div>
+    </section>
 
     <div style="margin-bottom: 15px;">
         <button id="verifyBtn" onclick="verifyLookups()" style="background: #16213e; color: #4fc3f7; border: 1px solid #0f3460; border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; cursor: pointer; transition: background 0.15s;">Verify lookups.yaml</button>
@@ -717,6 +828,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         });
         renderTimes();
     }
+
+    // F3b: last-call-from-Rauland banner. Re-render the durable last-call epoch
+    // (data-epoch) in the VIEWER'S browser timezone + a spoken relative age, same
+    // approach as the time toggle above. All writes go through textContent so any
+    // value stays inert; the server-rendered display_local is the no-JS fallback.
+    function relAge(epoch) {
+        var s = Math.max(0, (Date.now() / 1000) - epoch);
+        if (s < 45) return 'just now';
+        if (s < 3600) { var m = Math.max(1, Math.floor(s / 60)); return m + (m === 1 ? ' minute ago' : ' minutes ago'); }
+        if (s < 172800) { var h = Math.floor(s / 3600); return h + (h === 1 ? ' hour ago' : ' hours ago'); }
+        var d = Math.floor(s / 86400); return d + (d === 1 ? ' day ago' : ' days ago');
+    }
+    (function renderLastCall() {
+        var banner = document.getElementById('lastCallBanner');
+        if (!banner) return;
+        var timeEl = banner.querySelector('.last-call-time[data-epoch]');
+        if (timeEl) {
+            var epoch = parseFloat(timeEl.getAttribute('data-epoch'));
+            if (!isNaN(epoch)) timeEl.textContent = fmtLocal(new Date(epoch * 1000));
+        }
+        var ageEl = banner.querySelector('.last-call-age[data-epoch]');
+        if (ageEl) {
+            var ae = parseFloat(ageEl.getAttribute('data-epoch'));
+            if (!isNaN(ae)) ageEl.textContent = '(' + relAge(ae) + ')';
+        }
+    })();
 
     // Auto-refresh logic
     var autoCheck = document.getElementById('autoRefresh');
@@ -1577,6 +1714,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         # 'AND is_test=0'), paginated in Python — so the table and the logs share
         # one source of truth for "the selected day".
         calls = total_calls = total_pages = None
+        day_rows = None
         if not is_live:
             try:
                 day_start, day_end = _local_day_window(selected_date, tz_name)
@@ -1592,6 +1730,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                 logger.exception(
                     "F1: day-window call table failed; falling back to today")
                 calls = None
+                day_rows = None
         if calls is None:
             calls, total_calls, total_pages = await db.get_calls_page(
                 page=page, page_size=page_size, today_only=True,
@@ -1604,27 +1743,49 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             c["status_text"] = text
             c["status_class"] = css
 
-        stats = await db.get_today_stats()
+        # F3a: the Today-view stat numbers FOLLOW the selected day, like the table.
+        # Live/default -> get_today_stats (which now also counts suppressed dups);
+        # a HISTORICAL pick -> classify the day_rows already fetched for the table
+        # (same success/failed/pending/suppressed semantics). If the historical
+        # window failed and we fell back to today's table, fall back to live stats
+        # too so the cards stay consistent with what the table is actually showing.
+        if is_live or day_rows is None:
+            stats = await db.get_today_stats()
+        else:
+            stats = _stats_from_rows(day_rows)
         success = stats["success"]
         failed = stats["failed"]
         pending = stats.get("pending", 0)
+        suppressed = stats.get("suppressed", 0)
 
-        # inbound-liveness: last inbound SIP from Rauland (INFORMATIONAL, read-only,
-        # zero SIP impact). Green when fresh, amber once older than
-        # inbound_stale_after_seconds, grey when never seen (writer not yet stamping).
-        inbound_stale_after = getattr(
-            health_config, "inbound_stale_after_seconds", 432000.0)
+        # F3b: "Last call from Rauland" — the durable last ACTUAL call (is_test=0),
+        # read-only via get_last_call(). Unlike the inbound-SIP stamp (kept as-is on
+        # /health) this survives a writer restart and shows the true last page even
+        # if it was days ago. Rendered client-side in the viewer's browser TZ (the
+        # banner carries a data-epoch); display_local is the no-JS fallback. Any
+        # read failure or a non-dict (mocked) row degrades to "No calls on record."
+        last_call = None
         try:
-            inbound_epoch = await db.read_inbound_seen("inbound_sip")
+            lc_row = await db.get_last_call()
+            if isinstance(lc_row, dict) and isinstance(
+                    lc_row.get("created_at"), (int, float)):
+                lc_epoch = float(lc_row["created_at"])
+                lc_purpose = get_call_purpose(lc_row.get("display_name") or "")
+                ctx_bits = [b for b in (lc_purpose, lc_row.get("caller_id")) if b]
+                last_call = {
+                    "created_at": lc_epoch,
+                    "display_local": display_local(lc_epoch, tz_name),
+                    "age_label": _relative_age(max(0.0, time.time() - lc_epoch)),
+                    "context": " · ".join(str(b) for b in ctx_bits),
+                }
         except Exception:
-            inbound_epoch = None
-        if isinstance(inbound_epoch, (int, float)):
-            inbound_age_s = max(0.0, time.time() - inbound_epoch)
-            inbound_age_label = _format_age(inbound_age_s)
-            inbound_color = "#ff9800" if inbound_age_s > inbound_stale_after else "#4caf50"
-        else:
-            inbound_age_label = "never"
-            inbound_color = "#888"
+            logger.exception("F3b: get_last_call failed; hiding last-call banner")
+            last_call = None
+
+        # F3b: the last-inbound-SIP stamp is INTENTIONALLY no longer a dashboard
+        # stat card — it resets on writer restart, so the durable last-call banner
+        # above is the higher-value presentation. The /health last_inbound_sip_age_s
+        # field (a separate, valid link-liveness signal) is kept as-is below.
 
         # #13: date-picker log viewer. "A day" is the VIEWER's day, defined in the
         # configured display zone (logging.timezone; "" = host). Logs are UTC and
@@ -1684,8 +1845,8 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             success_calls=success,
             failed_calls=failed,
             pending_calls=pending,
-            inbound_age_label=inbound_age_label,
-            inbound_color=inbound_color,
+            suppressed_calls=suppressed,
+            last_call=last_call,
             page=page,
             total_pages=total_pages,
             auto_refresh=bool(auto),

@@ -650,15 +650,38 @@ class CallDatabase:
         success = by_state.get(STATE_DELIVERED, 0) + legacy_ok
         failed = by_state.get(STATE_FAILED, 0) + by_state.get(STATE_EXPIRED, 0) + legacy_bad
         pending = by_state.get(STATE_PENDING, 0) + by_state.get(STATE_DELIVERING, 0)
+        # F3a: #5 enforcement records suppressed duplicates as state='duplicate'
+        # (recorded, NOT delivered). Surface the count so the Today view can show
+        # how many pages were suppressed as clinical duplicates.
+        suppressed = by_state.get(STATE_DUPLICATE, 0)
 
         return {
             "success": success,
             "failed": failed,
             "pending": pending,
+            "suppressed": suppressed,
             "delivered": by_state.get(STATE_DELIVERED, 0),
             "expired": by_state.get(STATE_EXPIRED, 0),
             "by_state": by_state,
         }
+
+    async def get_last_call(self) -> Optional[Dict[str, Any]]:
+        """F3b: read-only lookup of the most recent REAL (is_test=0) call.
+
+        Returns the newest non-test row's ``created_at`` epoch plus ``caller_id``
+        and ``display_name`` (from which the dashboard derives the purpose) for
+        context, or ``None`` if there are no non-test calls on record. This is the
+        durable "last actual CALL from Rauland" — unlike the inbound-SIP stamp it
+        survives a writer restart and shows the true last page even if it was days
+        ago. Ignores dry-run/[TEST] rows (is_test=1), mirroring every other reader.
+        Purely a SELECT on the indexed created_at — safe under the read-only
+        dashboard's ``query_only=ON`` connection; it never mutates.
+        """
+        cur = await self._db.execute(
+            "SELECT created_at, caller_id, display_name FROM calls "
+            "WHERE is_test=0 ORDER BY created_at DESC LIMIT 1")
+        row = await cur.fetchone()
+        return dict(row) if row else None
 
     async def write_heartbeat(self, name: str = "writer") -> float:
         """Stamp the writer's liveness heartbeat (epoch). Returns the beat time."""
