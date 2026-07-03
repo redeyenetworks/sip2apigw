@@ -170,6 +170,37 @@ echo "  481 lines: $BAD481 | 'ACK for unknown call' lines: $BADACK"
   && pass "immediate-BYE is ACK-gated + spec-correct; zero 481 / zero unknown-ACK" \
   || fail "immediate-BYE teardown drill — investigate before cutover (rc=$M7_RC 481=$BAD481 unkAck=$BADACK)"
 
+echo "########## M8 — dedupe SUPPRESSION enforcement (#5) ##########"
+# enforce=true, window=2, bed-level: two same bed+purpose INVITEs <2s -> the 2nd is
+# SUPPRESSED (state 'duplicate', never delivered); a >2s re-page IS delivered. dry-run
+# means no real send ever leaves the box; we assert the DB state transitions.
+systemctl restart "$W"; sleep 4
+"$PY" - <<PY
+import socket, time
+HOST, PORT = "127.0.0.1", $SIP_PORT
+def invite(cid, caller):
+    sdp=("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
+         "t=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n")
+    m=(f"INVITE sip:gw@{HOST}:{PORT} SIP/2.0\r\n"
+       f"Via: SIP/2.0/UDP 127.0.0.1:40120;branch=z9hG4bK-{cid}\r\n"
+       f'From: "Code Blue" <sip:{caller}@127.0.0.1>;tag={cid}\r\n'
+       f"To: <sip:gw@{HOST}:{PORT}>\r\nCall-ID: {cid}@127.0.0.1\r\nCSeq: 1 INVITE\r\n"
+       f"Contact: <sip:{caller}@127.0.0.1:40120>\r\n"
+       f"Content-Type: application/sdp\r\nContent-Length: {len(sdp)}\r\n\r\n{sdp}")
+    s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2)
+    s.sendto(m.encode(),(HOST,PORT)); s.close()
+invite("m8a1","a799r101b1"); time.sleep(0.3); invite("m8a2","a799r101b1")  # <2s -> 2nd dropped
+time.sleep(3)
+invite("m8b1","a799r102b1"); time.sleep(3); invite("m8b2","a799r102b1")    # >2s -> both kept
+time.sleep(3)
+PY
+q(){ "$PY" -c "import sqlite3;c=sqlite3.connect('file:$DB?mode=ro',uri=True);print(c.execute(\"SELECT COUNT(*) FROM calls WHERE caller_id='$1' AND state='duplicate'\").fetchone()[0])"; }
+DUP1=$(q a799r101b1); DUP2=$(q a799r102b1)
+echo "  same-bed <2s: duplicates=$DUP1 (expect 1) | same-bed >2s: duplicates=$DUP2 (expect 0)"
+[[ "$DUP1" == "1" && "$DUP2" == "0" ]] \
+  && pass "suppression: 2nd rapid same-bed page dropped; >2s re-page delivered" \
+  || fail "dedupe enforcement drill — investigate before cutover (dup1=$DUP1 dup2=$DUP2)"
+
 echo "########## M2 — watchdog restart on a hung loop (#8) — takes ~4 min ##########"
 MP=$(systemctl show -p MainPID --value "$W")
 echo "  freezing writer PID $MP (SIGSTOP) — watchdog should kill+restart within ~WatchdogSec(30s)..."

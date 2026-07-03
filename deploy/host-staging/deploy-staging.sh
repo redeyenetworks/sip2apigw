@@ -57,8 +57,12 @@ health:
   heartbeat_interval_seconds: 10.0
   stale_after_seconds: 30.0
 dedupe:
-  enforce: false
-  window_seconds: 0
+  # Mirror the APPROVED production enforcement config so drill M8 exercises real
+  # suppression on real systemd (dry-run: no real send ever leaves the box).
+  enforce: true
+  window_seconds: 2
+  match_bed: true
+  match_purpose: true
 logging:
   log_dir: "${STAGING_LOG_DIR}"
   timezone: ""
