@@ -646,6 +646,50 @@ class TestCallDetail:
         assert 'href="/call/1?from=' in html
 
 
+class TestCallBundle(TestCallDetail):
+    """#13: GET /call/{id}/bundle.txt — plain-text per-call diagnostic bundle.
+
+    Reuses TestCallDetail's log/row fixtures. The bundle is built by the SAME
+    shared correlation builder as the HTML detail view, so it inherits the exact
+    Call-ID join and the is_test=0 discipline.
+    """
+
+    # --- exact SIP join (shared builder parity) --------------------------
+    def test_bundle_exact_sip_join(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log(),
+                         main_log=self._main_log())
+        r = c.get("/call/303/bundle.txt")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/plain")
+        assert "attachment" in r.headers.get("content-disposition", "")
+        body = r.text
+        assert "SIP/2.0 200 OK" in body          # matching SEND block joined in
+        assert self.CID in body
+        assert self.OTHER not in body            # the other call's block excluded
+        assert "httpx.ConnectTimeout: timed out" in body   # main-log traceback kept
+        assert "Code Blue! 1st Floor. E.D. Room 201." in body  # call record metadata
+
+    # --- is_test row is 404 (record-first / prod discipline) -------------
+    def test_bundle_is_test_404(self, tmp_path):
+        c = self._client(tmp_path, self._row(is_test=1), sip_log=self._sip_log())
+        assert c.get("/call/303/bundle.txt").status_code == 404
+
+    # --- unknown id -> 404 (never 500) -----------------------------------
+    def test_bundle_unknown_id_404(self, tmp_path):
+        db = AsyncMock(spec=CallDatabase)
+        db.get_call = AsyncMock(return_value=None)
+        lc = LoggingConfig(log_dir=str(tmp_path), timezone="UTC")
+        cfg = DashboardConfig(port=8080, bind_ip="0.0.0.0",
+                              auto_refresh_seconds=30, page_size=20)
+        c = TestClient(create_dashboard(db, cfg, log_config=lc))
+        assert c.get("/call/999999/bundle.txt").status_code == 404
+
+    # --- non-int id -> 422 (FastAPI path validation) ---------------------
+    def test_bundle_non_int_id_422(self, tmp_path):
+        c = self._client(tmp_path, self._row(), sip_log=self._sip_log())
+        assert c.get("/call/abc/bundle.txt").status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_get_calls_between_real_db(tmp_path):
     """#13-P1: get_calls_between returns only is_test=0 rows within [start,end]."""

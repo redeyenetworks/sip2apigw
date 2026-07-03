@@ -1387,6 +1387,108 @@ def _parse_api_blocks(lines: list) -> list:
     return blocks
 
 
+def _build_call_correlation(call: dict, log_dir, tz_name: str, *,
+                            sip_enabled: bool, api_enabled: bool):
+    """#13: shared, read-only correlation builder for a single call.
+
+    Used by BOTH the HTML detail view and the plain-text diagnostic bundle so
+    the two can never drift: the DB row's sip_call_id (written by #2) is the
+    AUTHORITATIVE key and the SIP-log / main-log joins are EXACT Call-ID matches;
+    the api panel is a clearly-labelled heuristic. Zero SIP-path code. Never
+    raises — on any reader failure it logs and returns whatever it had (partial
+    or None sections), exactly like the original inline logic. Returns the triple
+    (sip_blocks, main_lines, api_candidates); a None section means "not attempted
+    / debug channel disabled", an empty list means "attempted, nothing matched".
+    """
+    created = call.get("created_at")
+    cid = call.get("sip_call_id")
+    sip_blocks = main_lines = api_candidates = None
+    if cid and isinstance(created, (int, float)):
+        try:
+            if sip_enabled:
+                sip_blocks = _sip_blocks_for_callid(
+                    str(log_dir), cid, created, tz_name)
+            main_lines = _main_lines_for_callid(
+                str(log_dir), cid, created, tz_name)
+            if api_enabled:
+                api_candidates = _api_heuristic(
+                    str(log_dir), call.get("tts_string") or "", created, tz_name)
+        except Exception:
+            logger.exception(
+                "call correlation failed for call %s", call.get("id"))
+    return sip_blocks, main_lines, api_candidates
+
+
+def _render_bundle_text(call: dict, sip_blocks, main_lines, api_candidates,
+                        tz_name: str) -> str:
+    """#13: render the shared correlation into a copy/paste-friendly plain-text
+    diagnostic bundle. Read-only; pure string assembly (no escaping needed — this
+    is text/plain, never HTML). Section shape mirrors the HTML detail view."""
+    rule = "=" * 72
+    out: list[str] = []
+
+    def section(title: str):
+        out.append(rule)
+        out.append(title)
+        out.append(rule)
+
+    cid = call.get("sip_call_id")
+    section(f"sipgw diagnostic bundle — call #{call.get('id')}")
+    out.append(f"Generated : {display_local(time.time(), tz_name)}  "
+               f"({_resolve_tz(tz_name)})")
+    out.append("")
+
+    section("CALL RECORD")
+    for key in ("id", "created_at", "caller_id", "display_name",
+                "area_number", "area_name", "room_number", "tts_string",
+                "fusion_status", "response_time_ms", "state", "attempts",
+                "last_error", "sip_call_id", "event_id"):
+        if key not in call:
+            continue
+        val = call.get(key)
+        if key == "created_at" and isinstance(val, (int, float)):
+            val = f"{display_local(val, tz_name)}  (epoch {val})"
+        out.append(f"  {key:16}: {'' if val is None else val}")
+    out.append("")
+
+    section("SIP MESSAGES (exact Call-ID join)")
+    if sip_blocks is None:
+        out.append("  (SIP debug logging disabled or unavailable)")
+    elif not sip_blocks:
+        if not cid:
+            out.append("  (pre-#2 legacy row: no sip_call_id to join on)")
+        else:
+            out.append("  (no SIP blocks matched this Call-ID)")
+    else:
+        for blk in sip_blocks:
+            out.extend(ln.rstrip("\n") for ln in blk["lines"])
+            out.append("")
+    out.append("")
+
+    section("APPLICATION LOG (Call-ID references)")
+    if not main_lines:
+        out.append("  (no application-log lines matched)")
+    else:
+        out.extend(ln.rstrip("\n") for ln in main_lines)
+    out.append("")
+
+    section("FUSION API EXCHANGE (heuristic — TTS/time match, provisional)")
+    if api_candidates is None:
+        out.append("  (API debug logging disabled or unavailable)")
+    elif not api_candidates:
+        out.append("  (No API delivery block found)")
+    else:
+        if len(api_candidates) > 1:
+            out.append(f"  Ambiguous: {len(api_candidates)} blocks matched "
+                       f"(provisional — none suppressed)")
+            out.append("")
+        for blk in api_candidates:
+            out.extend(ln.rstrip("\n") for ln in blk["lines"])
+            out.append("")
+
+    return "\n".join(out) + "\n"
+
+
 def _api_heuristic(log_dir: str, tts: str, created_epoch: float,
                    tzname: str, window: float = 180.0) -> list:
     """HEURISTIC / provisional: api_debug carries no Call-ID, so a page's Fusion
@@ -1637,20 +1739,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         cid = call.get("sip_call_id")
         glyph, text, css = _plain_status(call.get("fusion_status"))
 
-        sip_blocks = main_lines = api_candidates = None
-        if cid and isinstance(created, (int, float)):
-            try:
-                if sip_debug_enabled:
-                    sip_blocks = _sip_blocks_for_callid(
-                        str(log_dir), cid, created, tz_name)
-                main_lines = _main_lines_for_callid(
-                    str(log_dir), cid, created, tz_name)
-                if api_debug_enabled:
-                    api_candidates = _api_heuristic(
-                        str(log_dir), call.get("tts_string") or "", created, tz_name)
-            except Exception:
-                logger.exception(
-                    "call_detail: log correlation failed for call %s", call_id)
+        sip_blocks, main_lines, api_candidates = _build_call_correlation(
+            call, log_dir, tz_name,
+            sip_enabled=sip_debug_enabled, api_enabled=api_debug_enabled)
 
         html = detail_template.render(
             call=call,
@@ -1669,6 +1760,37 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             back_href=back_href,
         )
         return HTMLResponse(content=html)
+
+    @app.get("/call/{call_id}/bundle.txt", response_class=PlainTextResponse)
+    async def call_bundle(call_id: int):
+        """#13: per-call plain-text diagnostic bundle (copy/paste for a ticket).
+
+        Read-only, zero SIP-path code. Reuses the SAME shared correlation builder
+        as the HTML detail view, so it inherits the EXACT Call-ID join and the
+        strict is_test=0 discipline: an unknown id or a dry-run/[TEST] row (never
+        present in prod) is treated as not found -> 404 (never 500); a non-int
+        path -> FastAPI 422. Streamed as a text/plain attachment.
+        """
+        tz_name = log_config.timezone if log_config else ""
+        try:
+            call = await db.get_call(call_id)
+        except Exception:
+            logger.exception("call_bundle: get_call(%s) failed", call_id)
+            call = None
+        if not call or call.get("is_test"):
+            return PlainTextResponse(
+                f"call {call_id} not found\n", status_code=404)
+
+        sip_blocks, main_lines, api_candidates = _build_call_correlation(
+            call, log_dir, tz_name,
+            sip_enabled=sip_debug_enabled, api_enabled=api_debug_enabled)
+        body = _render_bundle_text(
+            call, sip_blocks, main_lines, api_candidates, tz_name)
+        filename = f"sipgw-call-{call_id}.txt"
+        return PlainTextResponse(
+            body,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/api/calls")
     async def api_calls(limit: int = 100):
