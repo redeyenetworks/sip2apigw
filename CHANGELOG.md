@@ -4,6 +4,19 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.2] — 2026-07-03
+
+Dashboard-only (zero SIP-path impact).
+
+- **#13 timezone-aware date-picker log viewer.** The log viewer gains a date
+  picker across all three streams. "A day" is the **viewer's day**, defined in the
+  configured display zone (`logging.timezone`, labelled in the UI). Because logs
+  are UTC-stamped and rotate at UTC midnight, a local day is gathered across the
+  overlapping UTC archive(s) and filtered by each entry's timestamp (DST-correct;
+  multi-line entries kept as a unit). Avoids re-decompressing: the day list is
+  built from archive filenames, and reads decompress at most the 1–2 relevant
+  archives, cached by `(path, mtime)`. UTC rotation is unchanged.
+
 ## [v1.6.1] — 2026-07-02
 
 Backlog burn-down: a batch of **safe, additive, outage-free** observability + diagnostics
