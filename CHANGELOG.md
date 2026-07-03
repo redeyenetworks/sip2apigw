@@ -4,6 +4,42 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.3] — 2026-07-03
+
+Backlog burn-down batch. Dashboard parts deploy with **zero SIP impact** (restart
+only `sipgw-dashboard`); the two writer parts activate on a coordinated writer
+restart (additive/idempotent, safe even on an unplanned one).
+
+### Dashboard (zero SIP impact)
+- **#7 opt-in Fusion-unreachable /health signal (closes #7).** New
+  `health.fail_on_fusion_unreachable` (default **false**) + `fusion_unreachable_max_age_seconds`;
+  when off (default), `/health` behavior is byte-for-byte unchanged (status stays
+  heartbeat-only). When an operator opts in, a *stale/failed* Fusion probe can degrade
+  `/health` — never a transient blip.
+- **#13 F1 — the date picker now also drives the call table + stats**, not just the log
+  viewer: selecting a day filters the table/stats/logs to that **local** day (one
+  `_local_day_window` source of truth).
+- **#13 F2 — 90-day stacked "calls by type" chart.** A self-contained inline SVG stacked
+  bar chart over the last 90 local days, stacked by call **type/purpose** (Code Blue /
+  RRT / Code Pink / any future type — derived from `display_name` via lookups, so all
+  legacy rows count). No external JS/CDN; excludes `is_test=1`.
+- **#13 Phase-2 — `/call/{id}` correlated call-detail view.** Joins the call row with its
+  exact SIP + main-log lines by Call-ID (read-only, autoescaped; test rows 404 to keep
+  the UI-wide `is_test=0` discipline).
+
+### Writer (coordinated restart)
+- **#15 persist the upstream `event_id`.** Idempotent nullable `event_id` column + index
+  (legacy rows stay NULL), threaded from the INVITE through record-first
+  `create_pending_call` and surfaced read-only on the dashboard. The extraction shipped
+  in v1.6.1; this stores it (and is the merge-key prerequisite for #17 HA and #5's
+  event-id dedupe).
+- **Inbound-liveness / Rauland-reachability monitor (new).** An additive stamp of the
+  last inbound SIP receive time (after the IP allowlist — no behavior change to
+  INVITE/ACK/BYE), persisted like the heartbeat and surfaced as `last_inbound_sip_age_s`
+  in `/health` + a dashboard card. Answers "is the Rauland link up, or just quiet?".
+  Optional silence escalation is **default OFF** (`inbound_escalate_after_seconds=0`);
+  the age never flips the `/health` status code.
+
 ## [v1.6.2] — 2026-07-03
 
 Dashboard-only (zero SIP-path impact).
