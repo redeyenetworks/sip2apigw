@@ -28,10 +28,17 @@ class DuplicateMatch(NamedTuple):
     stores in ``duplicate_of``), plus its ``created_at`` epoch and
     ``sip_call_id`` so the audit line can log the inter-page gap and cross-
     reference both pages' Call-IDs. NEVER gates delivery.
+
+    ``event_id`` (#5 shadow annotation) is the prior row's #15 upstream event
+    id, carried back so the audit line can annotate whether the cf-v1 clinical
+    match ALSO shares the upstream event id. It is ANNOTATION ONLY: the match
+    is keyed solely on the clinical cf-v1 identity — event_id is never part of
+    the WHERE clause or any match filter, and never gates delivery.
     """
     id: int
     created_at: float
     sip_call_id: Optional[str]
+    event_id: Optional[str] = None
 
 
 # --- #12 canonical time helpers -------------------------------------------
@@ -411,8 +418,10 @@ class CallDatabase:
         within the window (``created_at >= since_epoch`` — keyed off the numeric
         epoch per #12, NEVER the timestamp string), excluding the just-inserted
         row (``exclude_id``). Returns a :class:`DuplicateMatch` (the row's id
-        plus its ``created_at`` epoch and ``sip_call_id`` for the audit line), or
-        None when there is no prior duplicate.
+        plus its ``created_at`` epoch, ``sip_call_id``, and #15 ``event_id`` for
+        the audit line), or None when there is no prior duplicate. The returned
+        ``event_id`` is ANNOTATION ONLY — it is NOT in the WHERE clause or any
+        match filter; the clinical cf-v1 identity stays the sole match key.
 
         area/room are stored columns and matched in SQL (leading zeros preserved
         by exact string match). bed and purpose are not stored as columns, so
@@ -432,7 +441,8 @@ class CallDatabase:
         if area_number is None or room_number is None:
             return None
 
-        sql = ("SELECT id, caller_id, display_name, created_at, sip_call_id "
+        sql = ("SELECT id, caller_id, display_name, created_at, sip_call_id, "
+               "event_id "
                "FROM calls "
                "WHERE area_number IS ? AND room_number IS ? AND is_test=? "
                "AND created_at >= ?")
@@ -459,6 +469,7 @@ class CallDatabase:
                 id=row["id"],
                 created_at=row["created_at"],
                 sip_call_id=row["sip_call_id"],
+                event_id=row["event_id"],   # #5 shadow annotation only (never a match key)
             )
         return None
 

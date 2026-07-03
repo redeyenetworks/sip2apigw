@@ -114,10 +114,13 @@ def extract_event_id(call_id: str) -> str:
     clinical event. Returns "" for any shape that doesn't have at least three
     segments. Never raises.
 
-    TELEMETRY / LOGGING ONLY. This value is emitted to the log and (optionally)
-    kept on the in-memory ActiveCall; it MUST NOT be consumed by any dedupe or
-    suppression decision — #5's clinical fingerprint (cf-v1:) is deliberately
-    separate and stays so.
+    TELEMETRY / LOGGING ONLY. This value is emitted to the log and kept on the
+    in-memory ActiveCall. It may now ANNOTATE #5's non-suppressing shadow audit
+    (recorded as ``event_id_match`` alongside the cf-v1 clinical decision), but
+    it MUST NEVER be a sole/primary suppression key nor relax the purpose
+    hard-guard: #5's clinical fingerprint (cf-v1:) remains the sole match key
+    and RRT vs Code Blue must never merge on a shared event_id.  [FLAG-FOR-REVIEW:
+    subtle safety-boundary wording — annotation-only, not a match/suppress key.]
     """
     try:
         parts = (call_id or "").split("-")
@@ -227,8 +230,9 @@ def invite_fingerprint_line(msg: "SIPMessage", addr, remote_rtp_port,
         INVITE fingerprint: call_id=.. event_id=.. from_tag=.. caller=.. \
             display=.. src=.. via=<origin>..>us> sdp_session=.. rtp_port=.. fp=..
 
-    ``event_id`` is LOGGING ONLY (see ``extract_event_id``) and must never feed a
-    dedupe/suppression decision. The builder never raises: any internal failure
+    ``event_id`` is LOGGING ONLY (see ``extract_event_id``); it may annotate #5's
+    non-suppressing shadow audit but must never be a sole/primary suppression key
+    nor relax the purpose guard. The builder never raises: any internal failure
     still yields a best-effort string so it can never abort answering an INVITE.
     """
     try:

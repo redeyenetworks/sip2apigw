@@ -34,11 +34,12 @@ async def _db(tmp_path) -> CallDatabase:
 
 
 async def _pending(db, area="730", room="201", bed=None,
-                   display="Code Blue", is_test=0) -> int:
+                   display="Code Blue", is_test=0, event_id=None) -> int:
     raw = f"a{area}r{room}" + (f"b{bed}" if bed else "")
     return await db.create_pending_call(
         caller_id=raw, display_name=display, area_number=area, area_name="",
-        room_number=room, tts_string="x", sip_call_id="c", is_test=is_test)
+        room_number=room, tts_string="x", sip_call_id="c", is_test=is_test,
+        event_id=event_id)
 
 
 # --------------------------------------------------------------- fingerprint
@@ -205,6 +206,105 @@ class TestDeduperShadow:
         await db.close()
 
 
+# --------------------------------------------- #5 shadow event_id annotation
+class TestEventIdShadowAnnotation:
+    """event_id is ANNOTATION ONLY: it enriches the non-suppressing shadow
+    audit (does the cf-v1 clinical match also share the upstream event id?),
+    but it is never a match key, never suppresses, and never relaxes the
+    purpose hard-guard. Every case below must still be delivered (no-suppress).
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_clinical_id_same_event_id_annotates_match(
+            self, tmp_path, caplog):
+        db = await _db(tmp_path)
+        r1 = await _pending(db, event_id="EVT-42")
+        r2 = await _pending(db, event_id="EVT-42")
+        dd = Deduper(DedupeConfig(enforce=False, window_seconds=300))
+        with caplog.at_level(logging.WARNING, logger="sipgw.dedupe"):
+            dec = await dd.evaluate(
+                db, caller=_caller(), row_id=r2, is_test=0, event_id="EVT-42")
+        # cf-v1 clinical match, and the shared event id is annotated True...
+        assert dec.duplicate_of == r1
+        assert dec.event_id_match is True
+        # ...yet the page is NEVER suppressed — record-first, delivered anyway.
+        assert dec.suppress is False
+        msg = next(r.getMessage() for r in caplog.records
+                   if "WOULD suppress" in r.getMessage())
+        assert "event_id_match=True" in msg
+        assert "this_event_id=EVT-42" in msg and "dup_event_id=EVT-42" in msg
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_same_clinical_id_different_event_id_counter_ticked(
+            self, tmp_path, caplog):
+        # The 6/80 shape: same clinical identity but a DIFFERENT upstream event
+        # id. Still a cf-v1 duplicate, event_id_match annotated False, no-suppress.
+        db = await _db(tmp_path)
+        r1 = await _pending(db, event_id="EVT-1")
+        r2 = await _pending(db, event_id="EVT-2")
+        dd = Deduper(DedupeConfig(enforce=False, window_seconds=300))
+        with caplog.at_level(logging.WARNING, logger="sipgw.dedupe"):
+            dec = await dd.evaluate(
+                db, caller=_caller(), row_id=r2, is_test=0, event_id="EVT-2")
+        assert dec.duplicate_of == r1          # cf-v1 clinical match stands
+        assert dec.event_id_match is False     # different event id
+        assert dec.suppress is False
+        msg = next(r.getMessage() for r in caplog.records
+                   if "WOULD suppress" in r.getMessage())
+        assert "event_id_match=False" in msg
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_event_id_either_side_annotates_false_no_crash(
+            self, tmp_path):
+        # Absent event_id on the prior row, on this page, or on both -> always
+        # event_id_match=False, and evaluate never raises.
+        db = await _db(tmp_path)
+        # prior row has an event id, this page has none
+        r1 = await _pending(db, event_id="EVT-9")
+        r2 = await _pending(db, event_id="EVT-9")
+        dd = Deduper(DedupeConfig(enforce=False, window_seconds=300))
+        dec = await dd.evaluate(
+            db, caller=_caller(), row_id=r2, is_test=0, event_id=None)
+        assert dec.duplicate_of == r1 and dec.event_id_match is False
+        assert dec.suppress is False
+
+        # prior row has no event id, this page does
+        r3 = await _pending(db, area="731", event_id=None)
+        r4 = await _pending(db, area="731", event_id="EVT-7")
+        dec2 = await dd.evaluate(
+            db, caller=_caller(area="731"), row_id=r4, is_test=0,
+            event_id="EVT-7")
+        assert dec2.duplicate_of == r3 and dec2.event_id_match is False
+
+        # both empty strings -> still no match, no crash
+        r5 = await _pending(db, area="732", event_id="")
+        r6 = await _pending(db, area="732", event_id="")
+        dec3 = await dd.evaluate(
+            db, caller=_caller(area="732"), row_id=r6, is_test=0, event_id="")
+        assert dec3.duplicate_of == r5 and dec3.event_id_match is False
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_purpose_guard_beats_matching_event_id(self, tmp_path):
+        # HARD SAFETY: even with an IDENTICAL upstream event id, RRT vs Code
+        # Blue must NOT merge — the purpose hard-guard wins over event_id, so
+        # there is no duplicate at all (and thus nothing to annotate).
+        db = await _db(tmp_path)
+        await _pending(db, display="Code Blue", event_id="EVT-SAME")
+        r2 = await _pending(db, display="RRT", event_id="EVT-SAME")
+        dd = Deduper(DedupeConfig(window_seconds=300))
+        dec = await dd.evaluate(
+            db, caller=_caller(display="RRT"), row_id=r2, is_test=0,
+            event_id="EVT-SAME")
+        assert dec.duplicate_of is None        # purpose guard: not a duplicate
+        assert dec.would_suppress is False
+        assert dec.event_id_match is False     # never annotated when no match
+        assert dec.suppress is False
+        await db.close()
+
+
 # ------------------------------------------------- find_recent_duplicate shape
 class TestFindRecentDuplicateReturn:
     @pytest.mark.asyncio
@@ -212,7 +312,7 @@ class TestFindRecentDuplicateReturn:
         # The richer return carries the prior row's created_at + sip_call_id so
         # the caller can compute the inter-page gap and cross-reference Call-IDs.
         db = await _db(tmp_path)
-        r1 = await _pending(db)                 # sip_call_id="c"
+        r1 = await _pending(db, event_id="EVT-carry")   # sip_call_id="c"
         r2 = await _pending(db)
         m = await db.find_recent_duplicate(
             area_number="730", room_number="201", bed_number=None,
@@ -220,6 +320,8 @@ class TestFindRecentDuplicateReturn:
         assert isinstance(m, DuplicateMatch)
         assert m.id == r1
         assert m.sip_call_id == "c"
+        # #5 shadow: the prior row's #15 event_id is carried back for annotation.
+        assert m.event_id == "EVT-carry"
         assert isinstance(m.created_at, float) and m.created_at > 0
         await db.close()
 

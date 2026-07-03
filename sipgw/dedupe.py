@@ -95,6 +95,11 @@ class DedupeDecision:
     duplicate_of: Optional[int] = None   # prior row id (telemetry only)
     would_suppress: bool = False         # a match was found within the window
     suppress: bool = False               # ALWAYS False unless (forbidden) enforce=True
+    # #5 shadow annotation: does the matched clinical duplicate ALSO share this
+    # page's #15 upstream event_id? Pure telemetry — it NEVER affects the match,
+    # duplicate_of, would_suppress, or suppress. False when either side has no
+    # event_id, or when the two event_ids differ (the counter-ticked shape).
+    event_id_match: bool = False
 
 
 class Deduper:
@@ -107,6 +112,7 @@ class Deduper:
         self, db, *, caller, purpose: Optional[str] = None,
         row_id: Optional[int] = None, is_test: int = 0,
         sip_call_id: Optional[str] = None,
+        event_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> DedupeDecision:
         """Compute the clinical fingerprint and, if a window is configured,
@@ -121,6 +127,15 @@ class Deduper:
         ``sip_call_id`` (this page's SIP Call-ID, optional) is logged alongside
         the prior page's Call-ID purely to cross-reference the two pages in the
         shadow audit trail; it never affects the decision.
+
+        ``event_id`` (this page's #15 upstream event id, optional) is ANNOTATION
+        ONLY: when a cf-v1 clinical match is found it is compared against the
+        prior row's event_id and the boolean result recorded as
+        ``event_id_match`` on the decision and appended to the shadow audit line
+        (so live evidence shows how often clinical matches also share the
+        upstream event id). It is NEVER a match key and NEVER relaxes the
+        purpose hard-guard — an empty/missing event_id on either side annotates
+        as no-match. RRT vs Code Blue still never merge regardless of event_id.
 
         This method never raises on a lookup failure — it logs and returns a
         no-suppress decision, because dedupe telemetry must never break delivery.
@@ -162,6 +177,15 @@ class Deduper:
             decision.duplicate_of = dup.id
             decision.would_suppress = True
             gap_seconds = now - dup.created_at
+            # #5 shadow annotation: does the cf-v1 clinical match ALSO share the
+            # upstream event id? Computed AFTER the (purpose-guarded) clinical
+            # match already succeeded, so it can only ANNOTATE — it can never
+            # create a match, and an empty/missing event_id on either side
+            # annotates as no-match. It NEVER relaxes the purpose hard-guard.
+            this_event_id = event_id or ""
+            dup_event_id = dup.event_id or ""
+            event_id_match = bool(this_event_id) and this_event_id == dup_event_id
+            decision.event_id_match = event_id_match
             if self.config.enforce:
                 # Unreachable in any validated config (validate_config makes
                 # enforce=True fatal). Present only so the enforce branch is
@@ -170,17 +194,21 @@ class Deduper:
                 logger.warning(
                     "SUPPRESS page fp=%s row=%s duplicate_of=%s gap=%.1fs "
                     "bed_match=%s purpose_match=%s this_call_id=%s dup_call_id=%s "
+                    "event_id_match=%s this_event_id=%s dup_event_id=%s "
                     "(window=%ss, enforce=ON)",
                     fp, row_id, dup.id, gap_seconds,
                     self.config.match_bed, self.config.match_purpose,
-                    sip_call_id, dup.sip_call_id, window)
+                    sip_call_id, dup.sip_call_id,
+                    event_id_match, this_event_id, dup_event_id, window)
             else:
                 logger.warning(
                     "WOULD suppress page fp=%s row=%s duplicate_of=%s gap=%.1fs "
                     "bed_match=%s purpose_match=%s this_call_id=%s dup_call_id=%s "
+                    "event_id_match=%s this_event_id=%s dup_event_id=%s "
                     "(window=%ss) — SHADOW, delivering anyway",
                     fp, row_id, dup.id, gap_seconds,
                     self.config.match_bed, self.config.match_purpose,
-                    sip_call_id, dup.sip_call_id, window)
+                    sip_call_id, dup.sip_call_id,
+                    event_id_match, this_event_id, dup_event_id, window)
 
         return decision

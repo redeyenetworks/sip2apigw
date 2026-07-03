@@ -211,6 +211,7 @@ class SIPGateway:
                 row_id=row_id,
                 is_test=1 if self._dry_run else 0,
                 sip_call_id=call_id,   # #5 telemetry: log the current page's Call-ID too
+                event_id=event_id or None,   # #5 shadow annotation only (never a match key)
             )
             if decision.duplicate_of is not None:
                 await self.db.record_duplicate_of(row_id, decision.duplicate_of)
