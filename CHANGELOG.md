@@ -4,6 +4,16 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.5] — 2026-07-03
+
+Dashboard-only (zero SIP impact).
+
+- **#13 date picker is now a most-recent-first dropdown.** Replaced the native date
+  input with a `<select>` whose options are **descending** (Today first, then
+  yesterday, …), so looking back a day or two is at the top of the list rather than
+  starting months ago. Works consistently across browsers. Today and the current
+  selection are always present.
+
 ## [v1.6.4] — 2026-07-03
 
 Dashboard-only (zero SIP impact) — date-picker UX.

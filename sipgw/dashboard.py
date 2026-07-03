@@ -380,7 +380,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .date-bar-form { display: flex; align-items: center; gap: 10px; }
         .date-bar-form label { color: #00d4ff; font-weight: 700; font-size: 1rem; }
         .date-bar-tz { color: #6f7fa8; font-weight: 400; font-size: 0.8rem; }
-        .date-bar input[type=date] {
+        .date-bar select {
             background: #0d1117; color: #e0e0e0; border: 1px solid #00d4ff;
             border-radius: 5px; padding: 7px 12px; font-size: 1rem; cursor: pointer;
         }
@@ -467,10 +467,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <form method="get" class="date-bar-form">
             <input type="hidden" name="view" value="{{ view }}">
             <label for="logdate-input">Viewing date <span class="date-bar-tz">({{ tz_label }})</span></label>
-            <input type="date" id="logdate-input" name="logdate" value="{{ selected_date }}"
-                   {% if available_dates %}min="{{ available_dates[0] }}"{% endif %} max="{{ today }}"
-                   list="sipgw-log-dates" onchange="this.form.submit()">
-            <datalist id="sipgw-log-dates">{% for d in available_dates %}<option value="{{ d }}"></option>{% endfor %}</datalist>
+            <select id="logdate-input" name="logdate" onchange="this.form.submit()">
+                {% for d in picker_dates %}
+                <option value="{{ d }}"{% if d == selected_date %} selected{% endif %}>{% if d == today %}Today &middot; {{ d }}{% else %}{{ d }}{% endif %}</option>
+                {% endfor %}
+            </select>
             <noscript><button type="submit">Go</button></noscript>
         </form>
         <span class="date-bar-state {% if is_live %}live{% else %}hist{% endif %}">
@@ -1465,6 +1466,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         else:
             selected_date = today_str          # default to TODAY (the current date)
         is_live = (selected_date == today_str)
+        # Picker options DESCENDING (most recent first) so "look back a day or two"
+        # is at the top; today and the current selection are always included.
+        picker_dates = sorted(set(available_dates) | {today_str, selected_date}, reverse=True)
 
         # Today/live uses the existing today-only path; a HISTORICAL day is read
         # from that same local-day window via get_calls_between (which enforces
@@ -1589,6 +1593,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             api_debug_lines=api_debug_lines,
             sip_debug_lines=sip_debug_lines,
             available_dates=available_dates,
+            picker_dates=picker_dates,
             selected_date=selected_date,
             today=today_str,
             is_live=is_live,

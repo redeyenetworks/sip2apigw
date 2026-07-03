@@ -93,7 +93,7 @@ class TestRoute:
         c = _client(tmp_path)
         r = c.get("/")
         assert r.status_code == 200
-        assert 'type="date"' in r.text and "America/New_York" in r.text   # zone labelled
+        assert 'name="logdate"' in r.text and "America/New_York" in r.text   # picker + zone
         # a definitely-historical local day (EST window excludes the next UTC day)
         r2 = c.get("/?logdate=2020-01-01")
         assert "DAYONE" in r2.text and "DAYTWO" not in r2.text and "(historical)" in r2.text
@@ -109,5 +109,20 @@ class TestRoute:
         _write_rotated(str(tmp_path), "sipgw.log", "2020-01-01",
                        "2020-01-01T12:00:00.000Z OLD\n")
         r = _client(tmp_path).get("/")
-        assert ('value="%s"' % today) in r.text     # picker input defaults to today
-        assert "Today" in r.text                      # live badge, not the 2020 date
+        assert ('value="%s" selected' % today) in r.text   # today option is selected
+        assert "Today" in r.text                            # labelled Today, not 2020
+
+    def test_picker_options_descending_today_first(self, tmp_path):
+        # The dropdown lists dates most-recent-first so "look back a day or two"
+        # is at the top, not months ago.
+        import datetime
+        from sipgw.dashboard import _resolve_tz
+        today = datetime.datetime.now(_resolve_tz(NY)).strftime("%Y-%m-%d")
+        for d in ("2020-01-01", "2020-06-15", "2021-03-10"):
+            _write_rotated(str(tmp_path), "sipgw.log", d, d + "T12:00:00.000Z x\n")
+        r = _client(tmp_path).get("/")
+        # positions of each option value in the HTML, in appearance order
+        import re
+        opts = re.findall(r'<option value="(\d{4}-\d{2}-\d{2})"', r.text)
+        assert opts == sorted(opts, reverse=True)    # descending
+        assert opts[0] == today                       # today first
