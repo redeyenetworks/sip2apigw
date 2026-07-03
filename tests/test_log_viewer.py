@@ -84,16 +84,30 @@ def _client(tmp_path, tz=NY):
 
 class TestRoute:
     def test_picker_labels_zone_and_windows(self, tmp_path):
-        _write_rotated(str(tmp_path), "sipgw.log", "2026-07-02",
-                       "2026-07-02T12:00:00.000Z DAYTWO\n")
-        _write_rotated(str(tmp_path), "sipgw.log", "2026-07-03",
-                       "2026-07-03T12:00:00.000Z DAYTHREE\n")
+        # Use dates far in the past so they are unambiguously historical (the
+        # default view is now "today", so is_live depends on the real clock).
+        _write_rotated(str(tmp_path), "sipgw.log", "2020-01-01",
+                       "2020-01-01T12:00:00.000Z DAYONE\n")
+        _write_rotated(str(tmp_path), "sipgw.log", "2020-01-02",
+                       "2020-01-02T12:00:00.000Z DAYTWO\n")
         c = _client(tmp_path)
         r = c.get("/")
         assert r.status_code == 200
         assert 'type="date"' in r.text and "America/New_York" in r.text   # zone labelled
-        # historical local day
-        r2 = c.get("/?logdate=2026-07-02")
-        assert "DAYTWO" in r2.text and "DAYTHREE" not in r2.text and "(historical)" in r2.text
+        # a definitely-historical local day (EST window excludes the next UTC day)
+        r2 = c.get("/?logdate=2020-01-01")
+        assert "DAYONE" in r2.text and "DAYTWO" not in r2.text and "(historical)" in r2.text
         # invalid date -> safe fallback, no 500
         assert c.get("/?logdate=1999-13-99").status_code == 200
+
+    def test_defaults_to_today_not_last_logged_day(self, tmp_path):
+        # The only logs are from 2020, but the picker must default to TODAY
+        # (the current date), not the last day that happens to have logs.
+        import datetime
+        from sipgw.dashboard import _resolve_tz
+        today = datetime.datetime.now(_resolve_tz(NY)).strftime("%Y-%m-%d")
+        _write_rotated(str(tmp_path), "sipgw.log", "2020-01-01",
+                       "2020-01-01T12:00:00.000Z OLD\n")
+        r = _client(tmp_path).get("/")
+        assert ('value="%s"' % today) in r.text     # picker input defaults to today
+        assert "Today" in r.text                      # live badge, not the 2020 date

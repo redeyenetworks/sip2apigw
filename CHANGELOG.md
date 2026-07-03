@@ -4,6 +4,17 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [v1.6.4] — 2026-07-03
+
+Dashboard-only (zero SIP impact) — date-picker UX.
+
+- **#13 the date picker now defaults to the current date** (was: the last day that
+  happened to have logs, which could show a stale month) and moved to a **prominent
+  labelled bar at the top** of the page (📅 "Viewing date (zone)" + a Today/Historical
+  badge + "Back to today"), since it drives the whole page (call table + stats + logs),
+  not just the log panel. The redundant in-log picker was removed. Today/live keeps the
+  existing today-only query; a historical pick uses the local-day window.
+
 ## [v1.6.3] — 2026-07-03
 
 Backlog burn-down batch. Dashboard parts deploy with **zero SIP impact** (restart

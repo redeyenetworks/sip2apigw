@@ -369,6 +369,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .copy-btn:hover { background: #347d39; color: #fff; border-color: #347d39; }
         .copy-btn.copied { background: #347d39; color: #fff; border-color: #347d39; }
+        /* Prominent date picker bar — controls the whole page (table + logs). */
+        .date-bar {
+            display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+            background: #12203f; border: 2px solid #00d4ff; border-radius: 8px;
+            padding: 12px 18px; margin-bottom: 22px;
+            box-shadow: 0 0 0 1px rgba(0,212,255,0.15);
+        }
+        .date-bar-icon { font-size: 1.35rem; line-height: 1; }
+        .date-bar-form { display: flex; align-items: center; gap: 10px; }
+        .date-bar-form label { color: #00d4ff; font-weight: 700; font-size: 1rem; }
+        .date-bar-tz { color: #6f7fa8; font-weight: 400; font-size: 0.8rem; }
+        .date-bar input[type=date] {
+            background: #0d1117; color: #e0e0e0; border: 1px solid #00d4ff;
+            border-radius: 5px; padding: 7px 12px; font-size: 1rem; cursor: pointer;
+        }
+        .date-bar-state { font-size: 0.9rem; font-weight: 700; }
+        .date-bar-state.live { color: #6ee7a8; }
+        .date-bar-state.hist { color: #ffcc80; }
+        .date-bar-today {
+            color: #4fc3f7; text-decoration: none; border: 1px solid #0f3460;
+            padding: 5px 12px; border-radius: 5px; font-size: 0.85rem;
+        }
+        .date-bar-today:hover { background: #0f3460; color: #fff; }
         /* F2: 90-day calls-by-type stacked chart (self-contained inline SVG). */
         .chart-panel {
             background: #16213e;
@@ -437,6 +460,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 {% if auto_refresh %}&#9679; ON{% else %}&#9675; OFF{% endif %}
             </span>
         </div>
+    </div>
+
+    <div class="date-bar">
+        <span class="date-bar-icon" aria-hidden="true">&#128197;</span>
+        <form method="get" class="date-bar-form">
+            <input type="hidden" name="view" value="{{ view }}">
+            <label for="logdate-input">Viewing date <span class="date-bar-tz">({{ tz_label }})</span></label>
+            <input type="date" id="logdate-input" name="logdate" value="{{ selected_date }}"
+                   {% if available_dates %}min="{{ available_dates[0] }}"{% endif %} max="{{ today }}"
+                   list="sipgw-log-dates" onchange="this.form.submit()">
+            <datalist id="sipgw-log-dates">{% for d in available_dates %}<option value="{{ d }}"></option>{% endfor %}</datalist>
+            <noscript><button type="submit">Go</button></noscript>
+        </form>
+        <span class="date-bar-state {% if is_live %}live{% else %}hist{% endif %}">
+            {% if is_live %}&#9679; Today &middot; live{% else %}&#9200; Historical{% endif %}
+        </span>
+        {% if not is_live %}<a class="date-bar-today" href="/">&#8635; Back to today</a>{% endif %}
     </div>
 
     <div class="stats">
@@ -573,20 +613,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     {% endif %}
 
-    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:30px; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
-        <h2 style="color: #00d4ff; font-size: 1.2rem; margin:0;">Logs{% if selected_date %} — <span style="font-weight:normal; font-size:0.85rem; color:{% if is_live %}#6ee7a8{% else %}#ffcc80{% endif %};">{{ selected_date }}{% if is_live %} (live){% else %} (historical){% endif %}</span>{% endif %}</h2>
-        <form method="get" style="display:flex; align-items:center; gap:8px; font-size:0.8rem;">
-            <input type="hidden" name="view" value="{{ view }}">
-            <label style="color:#aaa;">Log date <span style="color:#666;">({{ tz_label }})</span>
-                <input type="date" name="logdate" value="{{ selected_date or '' }}"
-                       {% if available_dates %}min="{{ available_dates[0] }}" max="{{ available_dates[-1] }}"{% endif %}
-                       list="sipgw-log-dates" onchange="this.form.submit()"
-                       style="background:#16213e; color:#e0e0e0; border:1px solid #0f3460; border-radius:4px; padding:3px 6px; font-size:0.8rem;">
-            </label>
-            <datalist id="sipgw-log-dates">{% for d in available_dates %}<option value="{{ d }}"></option>{% endfor %}</datalist>
-            {% if not is_live %}<a class="view-toggle" href="?view={{ view }}">&#8635; Live</a>{% endif %}
-        </form>
-    </div>
+    <h2 style="color: #00d4ff; font-size: 1.2rem; margin:30px 0 10px 0;">Logs — <span style="font-weight:normal; font-size:0.85rem; color:{% if is_live %}#6ee7a8{% else %}#ffcc80{% endif %};">{{ selected_date }}{% if is_live %} (today){% else %} (historical){% endif %}</span> <span style="color:#666; font-size:0.8rem;">— use the date picker at the top</span></h2>
     <div class="log-panel">
         <button class="copy-btn" onclick="copyLog(this)">Copy</button>
         <pre style="background: #0d1117; border: 1px solid #0f3460; border-radius: 8px; padding: 15px; font-size: 0.78rem; line-height: 1.5; overflow-x: auto; max-height: 600px; overflow-y: auto; color: #c9d1d9; white-space: pre-wrap; word-wrap: break-word;">{% if log_lines %}{% for line in log_lines %}{{ line }}
@@ -1432,14 +1459,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         # log coverage at all (selected_date is None) we preserve the original
         # today-only path so behaviour is unchanged on a fresh install.
         available_dates = _available_log_days(str(log_dir), log_bases, tz_name)
-        if logdate and logdate in available_dates:
-            selected_date = logdate
+        today_str = datetime.now(_resolve_tz(tz_name)).strftime("%Y-%m-%d")
+        if logdate and _LOG_DATE_RE.match(logdate):
+            selected_date = logdate            # explicit pick (any valid date)
         else:
-            selected_date = available_dates[-1] if available_dates else None
-        is_live = bool(available_dates) and selected_date == available_dates[-1]
+            selected_date = today_str          # default to TODAY (the current date)
+        is_live = (selected_date == today_str)
 
+        # Today/live uses the existing today-only path; a HISTORICAL day is read
+        # from that same local-day window via get_calls_between (which enforces
+        # 'AND is_test=0'), paginated in Python — so the table and the logs share
+        # one source of truth for "the selected day".
         calls = total_calls = total_pages = None
-        if selected_date:
+        if not is_live:
             try:
                 day_start, day_end = _local_day_window(selected_date, tz_name)
                 # get_calls_between is inclusive on both bounds; nudge the end a
@@ -1453,9 +1485,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             except Exception:
                 logger.exception(
                     "F1: day-window call table failed; falling back to today")
-                calls = total_calls = total_pages = None
-                selected_date = None
-                is_live = False
+                calls = None
         if calls is None:
             calls, total_calls, total_pages = await db.get_calls_page(
                 page=page, page_size=page_size, today_only=True,
@@ -1560,6 +1590,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             sip_debug_lines=sip_debug_lines,
             available_dates=available_dates,
             selected_date=selected_date,
+            today=today_str,
             is_live=is_live,
             tz_label=tz_label,
             time_ctx=_time_context(log_config),
