@@ -4,6 +4,31 @@ All notable changes to the sipgw project are documented in this file.
 
 ---
 
+## [Unreleased] — v1.7 (writer)
+
+Behavioral SIP change — **writer restart** (brief ~0.3s SIP blip); no dashboard impact.
+
+- **#11 immediate-BYE is now ACK-gated (closes the 481 race).** In `immediate_bye`
+  mode the gateway used to send its BYE in the same tick as the `200 OK`, which
+  could outrun the caller's ACK and draw a **481 Call/Transaction Does Not Exist**.
+  The gateway now answers, keeps the call, **fires the page immediately (fully
+  decoupled from teardown)**, and defers the gateway BYE until the ACK confirms the
+  dialog. A new per-call **lost-ACK fallback** (`sip.immediate_bye_ack_timeout_seconds`,
+  default 2.0s) tears the dialog down and frees the RTP port if the ACK is lost, so a
+  dropped ACK can never strand the dialog or leak a port. The teardown funnel is
+  single-fire (atomic `answered → terminating`), so a duplicate ACK or an ACK/fallback
+  race can never double-send the BYE or double-free the port. A retransmitted INVITE
+  during the ACK-wait now hits the re-INVITE 200-resend branch instead of re-paging.
+- **#11 spec-correct BYE (additive).** The BYE request-URI now targets the caller's
+  **Contact** (falling back to `From-user@remote` when absent) and carries the
+  **reversed Record-Route** as its Route set. **Packet routing is unchanged** — the
+  datagram still goes to `remote_addr`; only the request-URI / Route header *content*
+  changed.
+- New knob `sip.immediate_bye_ack_timeout_seconds` (default 2.0). Staging now mirrors
+  production (`immediate_bye: true`) and a new **host drill M7** gates the deploy:
+  INVITE→200→ACK→BYE with zero 481 / zero "ACK for unknown call", plus the lost-ACK
+  fallback path.
+
 ## [v1.6.5] — 2026-07-03
 
 Dashboard-only (zero SIP impact).

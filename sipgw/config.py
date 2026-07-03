@@ -19,6 +19,12 @@ class SIPConfig:
     allowed_networks: List[str] = field(default_factory=lambda: ["172.16.0.0/12"])
     call_timeout_seconds: int = 600
     immediate_bye: bool = False
+    # #11 In immediate_bye mode the gateway answers (200 OK), keeps the call, and
+    # sends the deferred gateway BYE only once the caller's ACK confirms the
+    # dialog — so the BYE never outruns the three-way handshake (the 481 race).
+    # If the ACK is lost, this per-call fallback fires the BYE and frees the RTP
+    # port after this many seconds, so a dropped ACK can never strand the dialog.
+    immediate_bye_ack_timeout_seconds: float = 2.0
     rtp_port_range_start: int = 10000
     rtp_port_range_end: int = 20000
 
@@ -269,6 +275,15 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
             f"rtp_port_range_end ({s.rtp_port_range_end})")
     if s.call_timeout_seconds <= 0:
         warnings.append(f"sip.call_timeout_seconds is {s.call_timeout_seconds} (<=0)")
+    # #11 immediate-BYE ACK fallback. <=0 would fire the deferred BYE on the very
+    # next loop turn (before any real ACK could arrive), collapsing back toward
+    # the BYE-before-ACK race this knob exists to avoid. Non-fatal (only relevant
+    # when immediate_bye is on), but warn so it is not set to 0 by accident.
+    if s.immediate_bye and s.immediate_bye_ack_timeout_seconds <= 0:
+        warnings.append(
+            f"sip.immediate_bye_ack_timeout_seconds is "
+            f"{s.immediate_bye_ack_timeout_seconds} (<=0) — the deferred BYE would "
+            f"fire before an ACK could arrive; use a small positive value (e.g. 2.0)")
     if not s.allowed_networks:
         warnings.append("sip.allowed_networks is empty — all SIP sources will be rejected")
     for net in s.allowed_networks:

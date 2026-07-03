@@ -11,6 +11,7 @@ rather than implementing the full SIP specification.
 
 import asyncio
 import random
+import re
 import time
 import logging
 import socket
@@ -51,13 +52,24 @@ class ActiveCall:
     local_rtp_port: int
     caller_user: str
     caller_display_name: str
-    state: str = "trying"  # trying -> answered -> terminated
+    # trying -> answered -> terminating -> terminated.  #11 adds the intermediate
+    # "terminating" state: the immediate-BYE teardown funnel flips answered->
+    # terminating atomically (no await between check-and-set) so exactly one of
+    # {ACK, fallback, peer BYE, shutdown} sends the deferred gateway BYE.
+    state: str = "trying"
     rtp_stream: Optional[RTPSilenceStream] = None
     timeout_task: Optional[asyncio.Task] = None
     transport: object = None
     protocol_type: str = "udp"
     fingerprint: str = ""          # #15 INVITE transaction fingerprint
     event_id: str = ""             # #15 upstream event id (telemetry only)
+    # #11 spec-correct BYE targeting (additive; packet still goes to remote_addr):
+    # the caller's Contact URI becomes the BYE request-URI, and the reversed
+    # Record-Route set becomes the Route headers.
+    contact_uri: str = ""
+    record_route: list = field(default_factory=list)
+    # #11 per-call lost-ACK fallback timer for immediate_bye mode.
+    ack_timeout_task: Optional[asyncio.Task] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -388,6 +400,13 @@ class SIPServer:
             from_tag = self._extract_tag(from_header)
             to_tag = f"sipgw-{random.randint(100000, 999999)}"
 
+            # #11 capture the caller's Contact URI + Record-Route so a later BYE
+            # is spec-correct (request-URI = Contact, Route = reversed
+            # Record-Route). Purely additive string capture — no routing change.
+            contact_uri = self._parse_contact_uri(
+                msg.get_header("Contact") or msg.get_header("m") or "")
+            record_route = list(msg.get_headers("Record-Route"))
+
             # Create call record
             call = ActiveCall(
                 call_id=call_id,
@@ -405,6 +424,8 @@ class SIPServer:
                 protocol_type=protocol_type,
                 fingerprint=fingerprint,
                 event_id=extract_event_id(call_id),
+                contact_uri=contact_uri,
+                record_route=record_route,
             )
 
             self.calls[call_id] = call
@@ -434,18 +455,26 @@ class SIPServer:
         )
 
         if self.config.sip.immediate_bye:
-            # Immediate BYE mode: answer then immediately hang up, no RTP
+            # #11 Immediate-BYE mode, ACK-gated. We have already sent the 200 OK.
+            # The PAGE fires NOW (fully decoupled from teardown) via create_task.
+            # We KEEP the call in self.calls and defer the gateway BYE until the
+            # caller's ACK confirms the three-way handshake (see _handle_ack ->
+            # _immediate_bye_teardown), so the BYE never outruns the ACK and no
+            # 481 is drawn. A lost ACK is covered by the fallback timer below,
+            # which tears the call down (BYE + frees the RTP port) on its own.
             logger.info(
-                f"Call {call_id} answered+BYE (immediate): {caller_display} <{caller_user}> "
-                f"from {addr[0]}:{addr[1]}"
+                f"Call {call_id} answered (immediate-BYE, awaiting ACK): "
+                f"{caller_display} <{caller_user}> from {addr[0]}:{addr[1]}"
             )
-            self._send_bye(call)
-            self._free_rtp_port(local_rtp_port)
-            call.state = "terminated"
-            self.calls.pop(call_id, None)
 
-            # Trigger async callback for webhook + DB
+            # Trigger async callback for webhook + DB — BEFORE and independent of
+            # any teardown path. The page must not depend on ACK/BYE/fallback.
             asyncio.create_task(self._safe_callback(call))
+
+            # Lost-ACK fallback: if no ACK arrives within the window, tear down.
+            call.ack_timeout_task = asyncio.create_task(
+                self._immediate_bye_fallback(call)
+            )
             return
 
         # Start RTP silence stream
@@ -472,12 +501,61 @@ class SIPServer:
         asyncio.create_task(self._safe_callback(call))
 
     def _handle_ack(self, msg: SIPMessage, addr):
-        """Handle ACK — confirms call establishment."""
+        """Handle ACK — confirms call establishment.
+
+        #11 In immediate_bye mode the ACK is what confirms the three-way
+        handshake, so it is the trigger for the deferred gateway BYE. Firing the
+        BYE only now guarantees INVITE->200->ACK->BYE order (no 481). The
+        teardown funnel is idempotent, so a duplicate ACK cannot double-send.
+        """
         call_id = msg.get_call_id()
-        if call_id in self.calls:
+        call = self.calls.get(call_id)
+        if call is not None:
             logger.debug(f"ACK received for call {call_id}")
+            if self.config.sip.immediate_bye and call.state == "answered":
+                asyncio.create_task(
+                    self._immediate_bye_teardown(call, "after ACK")
+                )
         else:
             logger.debug(f"ACK for unknown call {call_id}")
+
+    async def _immediate_bye_teardown(self, call: ActiveCall, reason: str):
+        """#11 Single-fire teardown funnel for an immediate-BYE call.
+
+        Whichever of {ACK arrives, fallback timer fires, peer BYE, shutdown}
+        reaches here first flips answered->terminating with NO await between the
+        check and the set — atomic in the single-threaded event loop — so the
+        deferred gateway BYE is sent EXACTLY ONCE and the RTP port is freed
+        exactly once. All later callers see state != "answered" and return.
+        """
+        if call.state != "answered":
+            return
+        call.state = "terminating"
+
+        # Cancel the lost-ACK fallback unless we ARE that task (calling
+        # task.cancel() on the currently running task would abort this teardown).
+        task = call.ack_timeout_task
+        if task is not None and task is not asyncio.current_task() \
+                and not task.done():
+            task.cancel()
+
+        logger.info(f"Call {call.call_id} immediate-BYE teardown: {reason}")
+        self._send_bye(call)
+        await self._terminate_call(call, reason)
+
+    async def _immediate_bye_fallback(self, call: ActiveCall):
+        """#11 Lost-ACK safety net: if no ACK confirms the dialog within the
+        configured window, tear the call down anyway so a dropped ACK can never
+        strand the dialog or leak an RTP port."""
+        try:
+            await asyncio.sleep(
+                self.config.sip.immediate_bye_ack_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            return  # the ACK (or another path) already handled teardown
+        await self._immediate_bye_teardown(
+            call, "immediate-bye ACK-timeout fallback"
+        )
 
     async def _handle_bye(self, msg: SIPMessage, addr, transport, protocol_type):
         """Handle BYE — terminate the call."""
@@ -563,6 +641,14 @@ class SIPServer:
         if call.timeout_task and not call.timeout_task.done():
             call.timeout_task.cancel()
 
+        # #11 Cancel the immediate-BYE lost-ACK fallback if still pending. Guard
+        # against cancelling the currently running task (when this terminate is
+        # driven BY the fallback). Covers the peer-BYE / shutdown-during-ACK-wait
+        # paths that reach here without going through the teardown funnel.
+        if call.ack_timeout_task and not call.ack_timeout_task.done() \
+                and call.ack_timeout_task is not asyncio.current_task():
+            call.ack_timeout_task.cancel()
+
         # Free RTP port
         self._free_rtp_port(call.local_rtp_port)
 
@@ -574,8 +660,30 @@ class SIPServer:
             f"duration={duration:.1f}s"
         )
 
+    @staticmethod
+    def _parse_contact_uri(contact_header: str) -> str:
+        """Extract the bare URI from a Contact header for use as a request-URI.
+
+        Handles ``<sip:user@host:port>``, ``"name" <sip:...>;params`` and a bare
+        ``sip:user@host;params``. Returns "" when no URI is present.
+        """
+        if not contact_header:
+            return ""
+        m = re.search(r"<([^>]+)>", contact_header)
+        if m:
+            return m.group(1).strip()
+        # Bare URI form — drop any header parameters after the first ';'.
+        return contact_header.split(";")[0].strip()
+
     def _build_bye(self, call: ActiveCall) -> bytes:
         """Build a BYE request to end a call from our side.
+
+        #11 The request-URI targets the caller's captured Contact (falling back
+        to today's From-user@remote when the INVITE carried no Contact), and the
+        Route header set is the reversed Record-Route. Packet ROUTING is
+        unchanged — the datagram is still transmitted to ``call.remote_addr`` (the
+        INVITE source = the adjacent Record-Route hop); only the request-URI /
+        Route header CONTENT becomes spec-correct.
 
         The Via transport token must match the call's transport (UDP/TCP), not a
         hardcoded UDP — a TCP peer receiving a UDP Via is malformed signaling.
@@ -585,9 +693,19 @@ class SIPServer:
         branch = f"z9hG4bK-sipgw-{random.randint(100000, 999999)}"
         transport = (call.protocol_type or "udp").upper()
 
+        request_uri = call.contact_uri or (
+            f"sip:{call.caller_user}@{call.remote_addr[0]}:{call.remote_addr[1]}"
+        )
+        # Reversed Record-Route -> Route set (spec-correct for a UAS-issued
+        # in-dialog request). Emitted after the Via, before From.
+        route_lines = "".join(
+            f"Route: {r}\r\n" for r in reversed(call.record_route)
+        )
+
         bye = (
-            f"BYE sip:{call.caller_user}@{call.remote_addr[0]}:{call.remote_addr[1]} SIP/2.0\r\n"
+            f"BYE {request_uri} SIP/2.0\r\n"
             f"Via: SIP/2.0/{transport} {local_ip}:{port};branch={branch}\r\n"
+            f"{route_lines}"
             f"From: <sip:sipgw@{local_ip}:{port}>;tag={call.to_tag}\r\n"
             f"To: {call.from_header}\r\n"
             f"Call-ID: {call.call_id}\r\n"

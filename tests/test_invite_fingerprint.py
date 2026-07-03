@@ -22,6 +22,15 @@ from sipgw.sip_server import SIPServer
 _FP_RE = re.compile(r"^v1:[0-9a-f]{16}$")
 
 
+def _cancel_ack_fallbacks(server):
+    """#11 immediate_bye now arms a per-call lost-ACK fallback task; cancel any
+    that remain so they do not linger past a test's event loop."""
+    for c in list(server.calls.values()):
+        t = getattr(c, "ack_timeout_task", None)
+        if t and not t.done():
+            t.cancel()
+
+
 def _invite(call_id="c1@h", from_user="a730r201", from_tag="tag1",
             cseq="1 INVITE", via_branch="z9hG4bK-aaa", contact="a730r201@h:5061") -> bytes:
     sdp = ("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n"
@@ -235,7 +244,10 @@ class TestFingerprintOutageSafety:
         monkeypatch.setattr(sip_server_mod, "invite_fingerprint_line", _boom)
 
         config = AppConfig()
-        config.sip.immediate_bye = True  # no RTP/timeout tasks to leak
+        config.sip.immediate_bye = True
+        # #11 immediate_bye now DEFERS the BYE and arms a lost-ACK fallback task;
+        # make the window tiny and cancel it so nothing lingers at loop teardown.
+        config.sip.immediate_bye_ack_timeout_seconds = 0.01
         config.sip.rtp_port_range_start = 40000
         config.sip.rtp_port_range_end = 40100
         callback = AsyncMock()
@@ -258,6 +270,7 @@ class TestFingerprintOutageSafety:
         assert 100 in statuses, statuses
         assert 200 in statuses, statuses
         callback.assert_awaited()
+        _cancel_ack_fallbacks(server)
 
 
 class TestOnCallEventIdThreading:
@@ -268,6 +281,7 @@ class TestOnCallEventIdThreading:
         # main.on_call then persists via create_pending_call).
         config = AppConfig()
         config.sip.immediate_bye = True
+        config.sip.immediate_bye_ack_timeout_seconds = 0.01  # #11 tiny; cancelled below
         config.sip.rtp_port_range_start = 40000
         config.sip.rtp_port_range_end = 40100
         callback = AsyncMock()
@@ -288,12 +302,14 @@ class TestOnCallEventIdThreading:
         # positional: (call_id, caller_user, display_name, from_header, event_id)
         assert args[0] == "A1-B1-EVT7788-C1-0-13c4-764@h"
         assert args[4] == "EVT7788"
+        _cancel_ack_fallbacks(server)
 
     @pytest.mark.asyncio
     async def test_on_call_event_id_empty_for_short_call_id(self):
         # A malformed/short Call-ID yields an empty event id, still threaded.
         config = AppConfig()
         config.sip.immediate_bye = True
+        config.sip.immediate_bye_ack_timeout_seconds = 0.01  # #11 tiny; cancelled below
         config.sip.rtp_port_range_start = 40000
         config.sip.rtp_port_range_end = 40100
         callback = AsyncMock()
@@ -311,3 +327,4 @@ class TestOnCallEventIdThreading:
 
         callback.assert_awaited_once()
         assert callback.await_args.args[4] == ""
+        _cancel_ack_fallbacks(server)

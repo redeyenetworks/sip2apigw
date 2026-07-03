@@ -23,6 +23,12 @@ sip:
     - "10.0.0.0/8"
   call_timeout_seconds: 600
   immediate_bye: true
+  # #11 In immediate_bye mode the gateway answers (200 OK), keeps the call, and
+  # sends the deferred gateway BYE only once the caller's ACK confirms the dialog
+  # — so the BYE never outruns the three-way handshake (kills the 481 race). If
+  # the ACK is lost, this per-call fallback fires the BYE and frees the RTP port
+  # after this many seconds so a dropped ACK can never strand the dialog.
+  immediate_bye_ack_timeout_seconds: 2.0
   rtp_port_range_start: 10000
   rtp_port_range_end: 20000
 

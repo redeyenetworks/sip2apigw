@@ -41,7 +41,11 @@ sip:
   bind_ip: "127.0.0.1"
   bind_port: ${SIP_PORT}
   allowed_networks: ["127.0.0.0/8", "172.16.0.0/12"]
-  immediate_bye: false
+  # Mirror production (config.yaml.example): immediate_bye is ON so the M7 drill
+  # exercises the #11 ACK-gated deferred-BYE teardown on real systemd. A short
+  # ACK fallback keeps the lost-ACK case fast in the drill.
+  immediate_bye: true
+  immediate_bye_ack_timeout_seconds: 2.0
 fusion:
   base_url: "https://api.icmobile.singlewire.com/api"
   token_url: "https://api.icmobile.singlewire.com/api/token"

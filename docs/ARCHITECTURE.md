@@ -129,6 +129,39 @@ process is optional for delivery (only observability is lost if it is down).
 8. The SIP call is held until BYE or timeout; on termination RTP is stopped and
    the call is cleaned up. **Delivery is fully decoupled from SIP call teardown.**
 
+   In **`immediate_bye`** mode (production) the gateway does not hold RTP: it
+   answers with `200 OK`, fires the page immediately (step 5, decoupled), and
+   **defers the gateway BYE until the caller's ACK confirms the dialog** — see
+   the deferred-BYE state machine below.
+
+### #11 — Immediate-BYE ACK-gated teardown (deferred-BYE state machine)
+
+Sending the gateway BYE in the same tick as the `200 OK` (the old behavior)
+raced the caller's ACK: the BYE could reach the proxy before the three-way
+handshake completed, drawing a **481 Call/Transaction Does Not Exist**. The fix
+gates teardown on the ACK:
+
+- On the `INVITE`, after the `200 OK`, the call is **kept** in `self.calls`, the
+  page fires via `create_task(_safe_callback)` (never touches teardown), and a
+  per-call **lost-ACK fallback** timer is armed
+  (`immediate_bye_ack_timeout_seconds`, default 2.0s).
+- Any of **{ACK arrives, fallback fires, peer BYE, shutdown}** funnels through
+  one idempotent `_immediate_bye_teardown`, which flips `answered → terminating`
+  with **no `await` between the check and the set** (atomic in the single-thread
+  loop). The deferred BYE is therefore sent **exactly once** and the RTP port is
+  freed exactly once; a lost ACK still tears down (fallback) and a duplicate ACK
+  or an ACK/fallback race cannot double-send.
+- The **durability contract** is *answer-SIP-first, deliver-async*: the page is
+  recorded and dispatched independently of the ACK/BYE/fallback outcome, so a
+  lost ACK or a teardown error can never lose a Code Blue.
+
+The BYE is also made **spec-correct** (additive string-building only): the
+request-URI targets the caller's captured **Contact** (falling back to
+`From-user@remote` when the INVITE carried no Contact) and the **reversed
+Record-Route** becomes the Route header set. Packet **routing is unchanged** —
+the datagram is still transmitted to `call.remote_addr` (the INVITE source = the
+adjacent Record-Route hop); only the request-URI / Route header *content* changes.
+
 ## Shipped work (v1.6.0)
 
 ### #2 — Durable, record-first delivery + retry/backoff
@@ -252,12 +285,14 @@ state machine and are classified by their stored `fusion_status` for continuity
 across the cutover boundary. Every dashboard/stat/export query filters
 `is_test=0` so dry-run/test rows never appear in the live UI or an export.
 
-### #11 — Logging hygiene
+### #11 — Logging hygiene (shipped halves)
 
 BYE Via-transport correctness, credential masking (both `client_secret` **and**
 `client_id` in form bodies, `Authorization: Bearer` truncation, access-token
 masking in JSON responses), and `type(e).__name__` in exception logs. Autoescape,
 masking, and the SIP IP allowlist are treated as non-negotiable safety surfaces.
+The behavioral half of #11 — the ACK-gated deferred-BYE teardown that closes the
+481 race — is documented under [Call Flow](#11--immediate-bye-ack-gated-teardown-deferred-bye-state-machine).
 
 ### #12 — Canonical UTC RFC3339-Z timestamps, host-local display
 

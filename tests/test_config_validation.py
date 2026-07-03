@@ -124,6 +124,42 @@ class TestKeepaliveInterval:
         assert config.load_warnings == []          # known key, no typo warning
 
 
+class TestImmediateByeAckTimeout:
+    """#11 sip.immediate_bye_ack_timeout_seconds — additive; never fatal."""
+
+    def test_default_no_warning(self):
+        # Default (2.0s) with immediate_bye on must not warn.
+        c = _prod_ok()
+        c.sip.immediate_bye = True
+        warnings = validate_config(c, dry_run=False)
+        assert not any("immediate_bye_ack_timeout_seconds" in w for w in warnings)
+
+    def test_nonpositive_warns_not_fatal_when_immediate_bye_on(self):
+        c = _prod_ok()
+        c.sip.immediate_bye = True
+        c.sip.immediate_bye_ack_timeout_seconds = 0.0
+        warnings = validate_config(c, dry_run=False)   # must not raise
+        assert any("immediate_bye_ack_timeout_seconds" in w for w in warnings)
+
+    def test_nonpositive_no_warning_when_immediate_bye_off(self):
+        # The knob is irrelevant when immediate_bye is off, so no warning.
+        c = _prod_ok()
+        c.sip.immediate_bye = False
+        c.sip.immediate_bye_ack_timeout_seconds = 0.0
+        warnings = validate_config(c, dry_run=False)
+        assert not any("immediate_bye_ack_timeout_seconds" in w for w in warnings)
+
+    def test_key_loaded_from_yaml_no_typo_warning(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""
+            sip:
+              immediate_bye_ack_timeout_seconds: 1.5
+        """))
+        config = load_config(str(p))
+        assert config.sip.immediate_bye_ack_timeout_seconds == 1.5
+        assert config.load_warnings == []          # known key, no typo warning
+
+
 class TestFailOnFusionUnreachable:
     """#7 opt-in degrade flag — additive; default OFF; never fatal."""
 
