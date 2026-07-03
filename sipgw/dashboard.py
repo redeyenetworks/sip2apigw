@@ -9,6 +9,7 @@ import re
 import csv
 import io
 import time
+import hashlib
 import tarfile
 import logging
 import yaml
@@ -21,6 +22,7 @@ from datetime import datetime, timezone as _tz, timedelta, date as _date
 
 from .database import CallDatabase, display_local, _resolve_tz
 from .config import DashboardConfig, LoggingConfig
+from .lookups import get_call_purpose
 
 logger = logging.getLogger("sipgw.dashboard")
 
@@ -94,6 +96,129 @@ def _fusion_result_text(fusion_status) -> str:
     if code == -1:
         return "FAILED (delivery exception)"
     return f"FAILED (HTTP {code})"
+
+# F2: 90-day calls-by-TYPE stacked chart. "Type" = call PURPOSE, derived from
+# display_name via lookups.get_call_purpose (works for every row incl. legacy) —
+# it is NOT a stored column, so future purposes auto-appear from lookups.yaml.
+CHART_DAYS = 90
+
+# Deterministic type->colour palette: a fixed map for the known purposes, plus a
+# hashed HSL fallback so any future/unknown purpose still gets a stable colour
+# (hashlib, not the salted builtin hash(), so it is identical across processes).
+_FIXED_PURPOSE_COLORS = {
+    "Code Blue": "#4fc3f7",
+    "Rapid Response Team": "#ffb74d",
+    "Code Pink": "#f48fb1",
+    "Code": "#9e9e9e",
+}
+
+
+def _purpose_color(purpose: str) -> str:
+    """Stable colour for a call purpose (fixed map, else hashed HSL fallback)."""
+    if purpose in _FIXED_PURPOSE_COLORS:
+        return _FIXED_PURPOSE_COLORS[purpose]
+    h = int(hashlib.md5(purpose.encode("utf-8")).hexdigest(), 16)
+    return f"hsl({h % 360}, 55%, 62%)"
+
+
+def _purpose_sort_key(purpose: str):
+    """Deterministic legend/stack order: known purposes first, then alphabetical."""
+    known = list(_FIXED_PURPOSE_COLORS.keys())
+    return (0, known.index(purpose)) if purpose in known else (1, purpose)
+
+
+def _build_purpose_chart(rows, tz_name: str, now: Optional[float] = None) -> dict:
+    """F2: bucket (created_at, display_name) rows into a stacked-bar chart model.
+
+    Buckets by LOCAL day (display zone) and by derived purpose over the last
+    CHART_DAYS local days (zero-filled), then lays out a dependency-free inline
+    SVG stacked bar chart. Returns only numbers, hex/hsl colour strings and the
+    purpose labels — no markup — so Jinja autoescape stays fully in force.
+    """
+    now = time.time() if now is None else now
+    tz = _resolve_tz(tz_name)
+
+    # The CHART_DAYS local calendar days ending on today's local day (ascending).
+    today = datetime.fromtimestamp(now, tz).date()
+    days = [(today - timedelta(days=CHART_DAYS - 1 - i)).strftime("%Y-%m-%d")
+            for i in range(CHART_DAYS)]
+    day_index = {d: i for i, d in enumerate(days)}
+    buckets = {d: {} for d in days}          # zero-fill: every day present
+
+    for r in rows:
+        ca = r.get("created_at")
+        if not isinstance(ca, (int, float)):
+            continue
+        d = datetime.fromtimestamp(ca, tz).strftime("%Y-%m-%d")
+        if d not in day_index:               # outside the 90-local-day window
+            continue
+        purpose = get_call_purpose(r.get("display_name") or "")
+        buckets[d][purpose] = buckets[d].get(purpose, 0) + 1
+
+    purposes = sorted(
+        {p for day in buckets.values() for p in day}, key=_purpose_sort_key)
+
+    # Geometry (viewBox units; the SVG scales responsively to its container).
+    left, right, top, bottom = 40, 12, 12, 46
+    plot_w, plot_h = 900, 180
+    slot = plot_w / CHART_DAYS
+    bw = slot * 0.78
+    max_total = max((sum(day.values()) for day in buckets.values()), default=0)
+    y_scale = (plot_h / max_total) if max_total > 0 else 0.0
+
+    rects = []
+    for i, d in enumerate(days):
+        x0 = left + i * slot + (slot - bw) / 2.0
+        y_cursor = top + plot_h
+        for p in purposes:
+            c = buckets[d].get(p, 0)
+            if not c:
+                continue
+            h = c * y_scale
+            y_cursor -= h
+            rects.append({
+                "x": round(x0, 2), "y": round(y_cursor, 2),
+                "w": round(bw, 2), "h": round(h, 2),
+                "color": _purpose_color(p), "purpose": p,
+                "count": c, "day": d,
+            })
+
+    # Weekly x-axis ticks anchored on the most-recent day (today).
+    x_ticks = []
+    for i, d in enumerate(days):
+        if (CHART_DAYS - 1 - i) % 7 == 0:
+            x_ticks.append({"x": round(left + i * slot + slot / 2.0, 2),
+                            "label": d[5:]})   # MM-DD
+
+    # Integer y-axis ticks (0, mid, max) — only meaningful when there is data.
+    y_ticks = []
+    if max_total > 0:
+        seen = set()
+        for val in (0, (max_total + 1) // 2, max_total):
+            if val in seen:
+                continue
+            seen.add(val)
+            y_ticks.append({"y": round(top + plot_h - val * y_scale, 2),
+                            "label": val})
+
+    legend = [{"purpose": p, "color": _purpose_color(p),
+               "total": sum(buckets[d].get(p, 0) for d in days)}
+              for p in purposes]
+
+    return {
+        "width": left + plot_w + right,
+        "height": top + plot_h + bottom,
+        "baseline_y": round(top + plot_h, 2),
+        "left": left, "plot_w": plot_w,
+        "rects": rects,
+        "x_ticks": x_ticks,
+        "y_ticks": y_ticks,
+        "legend": legend,
+        "total": sum(sum(day.values()) for day in buckets.values()),
+        "days": CHART_DAYS,
+        "max_total": max_total,
+    }
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -244,6 +369,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .copy-btn:hover { background: #347d39; color: #fff; border-color: #347d39; }
         .copy-btn.copied { background: #347d39; color: #fff; border-color: #347d39; }
+        /* F2: 90-day calls-by-type stacked chart (self-contained inline SVG). */
+        .chart-panel {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 15px 18px;
+            margin-bottom: 20px;
+        }
+        .chart-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .chart-head h2 { color: #00d4ff; font-size: 1.1rem; margin: 0; }
+        .chart-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            font-size: 0.78rem;
+            color: #cbd5e1;
+        }
+        .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+        .legend-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            display: inline-block;
+        }
+        .chart-panel svg { width: 100%; height: auto; display: block; }
+        .chart-panel .axis-label { fill: #7f8bab; font-size: 11px; }
+        .chart-empty { color: #666; padding: 20px; text-align: center; }
     </style>
 </head>
 <body>
@@ -308,6 +467,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span id="verifyStatus" style="margin-left: 10px; font-size: 0.85rem;"></span>
     </div>
     <div id="verifyResult" style="display: none; margin-bottom: 20px;"></div>
+
+    {% if chart %}
+    <div class="chart-panel">
+        <div class="chart-head">
+            <h2>Calls by type &mdash; last {{ chart.days }} days</h2>
+            <div class="chart-legend">
+                {% for it in chart.legend %}
+                <span class="legend-item"><span class="legend-swatch" style="background: {{ it.color }};"></span>{{ it.purpose }} ({{ it.total }})</span>
+                {% endfor %}
+            </div>
+        </div>
+        {% if chart.total %}
+        <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" role="img" aria-label="Stacked bar chart of calls by type over the last {{ chart.days }} days, {{ chart.total }} calls total">
+            <line x1="{{ chart.left }}" y1="{{ chart.baseline_y }}" x2="{{ chart.left + chart.plot_w }}" y2="{{ chart.baseline_y }}" stroke="#2a3550" stroke-width="1"/>
+            {% for t in chart.y_ticks %}
+            <line x1="{{ chart.left }}" y1="{{ t.y }}" x2="{{ chart.left + chart.plot_w }}" y2="{{ t.y }}" stroke="#1e2a44" stroke-width="1"/>
+            <text x="{{ chart.left - 6 }}" y="{{ t.y + 3 }}" text-anchor="end" class="axis-label">{{ t.label }}</text>
+            {% endfor %}
+            {% for r in chart.rects %}
+            <rect x="{{ r.x }}" y="{{ r.y }}" width="{{ r.w }}" height="{{ r.h }}" fill="{{ r.color }}"><title>{{ r.day }} &middot; {{ r.purpose }}: {{ r.count }}</title></rect>
+            {% endfor %}
+            {% for t in chart.x_ticks %}
+            <text x="{{ t.x }}" y="{{ chart.baseline_y + 16 }}" text-anchor="middle" class="axis-label">{{ t.label }}</text>
+            {% endfor %}
+        </svg>
+        {% else %}
+        <div class="chart-empty">No calls in the last {{ chart.days }} days.</div>
+        {% endif %}
+    </div>
+    {% endif %}
 
     <table>
         <thead>
@@ -1061,6 +1250,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
             sip_debug_lines = _read_log_tail(sip_debug_file) if sip_debug_enabled else None
 
+        # F2: 90-day calls-by-TYPE stacked chart (read-only, zero SIP impact).
+        # Purpose is derived from display_name via lookups (not a stored column),
+        # so all rows incl. legacy are covered and future types auto-appear. Any
+        # read/build failure is swallowed so the dashboard never 500s on the chart.
+        chart = None
+        try:
+            since = time.time() - CHART_DAYS * 86400
+            chart_rows = await db.get_calls_since(since)
+            chart = _build_purpose_chart(chart_rows, tz_name)
+        except Exception:
+            logger.exception("F2: purpose chart build failed; hiding chart")
+            chart = None
+
         # Auto-refresh only makes sense on the live view, not historical logs.
         if not is_live:
             auto = 0
@@ -1090,6 +1292,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             is_live=is_live,
             tz_label=tz_label,
             time_ctx=_time_context(log_config),
+            chart=chart,
         )
         return HTMLResponse(content=html)
 

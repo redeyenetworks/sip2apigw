@@ -569,6 +569,23 @@ class CallDatabase:
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_calls_since(self, since_epoch: float) -> list:
+        """F2: read-only (created_at, display_name) for REAL calls since an epoch.
+
+        Feeds the 90-day calls-by-TYPE stacked chart. Type is NOT a stored column
+        — the dashboard derives it from display_name via lookups.get_call_purpose,
+        so this only needs the two columns. ALWAYS appends 'AND is_test=0' (mirrors
+        every other reader) so dry-run/test rows never colour the chart. Purely a
+        SELECT on the indexed created_at — safe under the dashboard's query_only=ON.
+        """
+        cursor = await self._db.execute(
+            "SELECT created_at, display_name FROM calls "
+            "WHERE created_at >= ? AND is_test=0 ORDER BY created_at ASC",
+            (since_epoch,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def get_today_stats(self) -> dict:
         """State-aware counts for today's REAL calls (is_test=0).
 
