@@ -76,7 +76,7 @@ class TestMigration:
             # New columns present.
             cols = _columns(p)
             for c in ("state", "attempts", "last_error", "delivered_at",
-                      "sip_call_id", "duplicate_of", "is_test"):
+                      "sip_call_id", "duplicate_of", "is_test", "event_id"):
                 assert c in cols, c
             # No rows lost; all pre-existing rows backfilled as legacy.
             rows = await db.get_recent_calls(limit=100)
@@ -84,6 +84,8 @@ class TestMigration:
             assert all(r["state"] == STATE_LEGACY for r in rows)
             assert all(r["attempts"] == 0 for r in rows)
             assert all(r["is_test"] == 0 for r in rows)
+            # #15: event_id is a nullable ADD COLUMN — no backfill, legacy rows NULL.
+            assert all(r["event_id"] is None for r in rows)
             # Original values preserved.
             byid = {r["caller_id"]: r for r in rows}
             assert byid["a797r2201b1"]["tts_string"].endswith("Prepost 1.")
@@ -123,8 +125,26 @@ class TestMigration:
         db = CallDatabase(p)
         await db.initialize()
         cols = _columns(p)
-        assert {"state", "attempts", "is_test", "sip_call_id"} <= cols
+        assert {"state", "attempts", "is_test", "sip_call_id", "event_id"} <= cols
         await db.close()
+
+    @pytest.mark.asyncio
+    async def test_event_id_index_created_and_idempotent(self, tmp_path):
+        # #15: idx_calls_event_id makes the column a usable merge/dedup key
+        # (the #17 HA-Phase-2 prerequisite). Created after the ADD COLUMN.
+        p = str(tmp_path / "old.db")
+        _make_old_db(p)
+        db = CallDatabase(p)
+        await db.initialize()
+        try:
+            cur = await db._db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_calls_event_id'")
+            assert (await cur.fetchone()) is not None
+            # a second migrate must not error (CREATE INDEX IF NOT EXISTS)
+            assert await db._migrate() == []
+        finally:
+            await db.close()
 
 
 class TestDeliveryStateMachine:
@@ -150,6 +170,23 @@ class TestDeliveryStateMachine:
         row = await db.get_call(cid)
         assert row["state"] == STATE_DELIVERED
         assert row["fusion_status"] == 200 and row["delivered_at"] is not None
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_create_pending_persists_event_id(self, tmp_path):
+        # #15: event_id threads through create_pending_call and reads back;
+        # omitting it leaves the column NULL (no default backfill).
+        db = await self._fresh(tmp_path)
+        with_evt = await db.create_pending_call(
+            caller_id="a730r201", display_name="Code Blue", area_number="730",
+            area_name="E.D.", room_number="201", tts_string="Code Blue!",
+            sip_call_id="A1-B1-EVT7788-C1-0-13c4-764@h", event_id="EVT7788")
+        assert (await db.get_call(with_evt))["event_id"] == "EVT7788"
+
+        without = await db.create_pending_call(
+            caller_id="a731r400", display_name="Code Blue", area_number="731",
+            area_name="I.C.U.", room_number="400", tts_string="Code Blue!")
+        assert (await db.get_call(without))["event_id"] is None
         await db.close()
 
     @pytest.mark.asyncio

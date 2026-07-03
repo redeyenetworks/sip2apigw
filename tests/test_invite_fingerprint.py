@@ -258,3 +258,56 @@ class TestFingerprintOutageSafety:
         assert 100 in statuses, statuses
         assert 200 in statuses, statuses
         callback.assert_awaited()
+
+
+class TestOnCallEventIdThreading:
+    @pytest.mark.asyncio
+    async def test_on_call_receives_extracted_event_id(self):
+        # #15: a driven INVITE threads the extracted upstream event id through
+        # _safe_callback into on_call as the trailing positional arg (which
+        # main.on_call then persists via create_pending_call).
+        config = AppConfig()
+        config.sip.immediate_bye = True
+        config.sip.rtp_port_range_start = 40000
+        config.sip.rtp_port_range_end = 40100
+        callback = AsyncMock()
+        server = SIPServer(config=config, on_call=callback)
+
+        class FakeTransport:
+            def sendto(self, data, addr):
+                pass
+
+        raw = _rauland_invite(call_id="A1-B1-EVT7788-C1-0-13c4-764@h", from_tag="tX")
+        msg = parse_sip_message(raw)
+        await server._handle_invite(msg, ("172.20.9.170", 5060),
+                                    FakeTransport(), "udp")
+        await asyncio.sleep(0)  # let the _safe_callback task run
+
+        callback.assert_awaited_once()
+        args = callback.await_args.args
+        # positional: (call_id, caller_user, display_name, from_header, event_id)
+        assert args[0] == "A1-B1-EVT7788-C1-0-13c4-764@h"
+        assert args[4] == "EVT7788"
+
+    @pytest.mark.asyncio
+    async def test_on_call_event_id_empty_for_short_call_id(self):
+        # A malformed/short Call-ID yields an empty event id, still threaded.
+        config = AppConfig()
+        config.sip.immediate_bye = True
+        config.sip.rtp_port_range_start = 40000
+        config.sip.rtp_port_range_end = 40100
+        callback = AsyncMock()
+        server = SIPServer(config=config, on_call=callback)
+
+        class FakeTransport:
+            def sendto(self, data, addr):
+                pass
+
+        raw = _rauland_invite(call_id="noHyphensHere@h", from_tag="tY")
+        msg = parse_sip_message(raw)
+        await server._handle_invite(msg, ("172.20.9.170", 5060),
+                                    FakeTransport(), "udp")
+        await asyncio.sleep(0)
+
+        callback.assert_awaited_once()
+        assert callback.await_args.args[4] == ""

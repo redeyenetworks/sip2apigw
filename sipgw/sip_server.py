@@ -61,8 +61,9 @@ class ActiveCall:
     created_at: float = field(default_factory=time.time)
 
 
-# Type for the call callback
-CallCallback = Callable[[str, str, str, str, int, int], Awaitable[None]]
+# Type for the call callback:
+# (call_id, caller_user, caller_display_name, from_header, event_id) -> awaitable
+CallCallback = Callable[[str, str, str, str, str], Awaitable[None]]
 
 
 class SIPUDPProtocol(asyncio.DatagramProtocol):
@@ -597,6 +598,7 @@ class SIPServer:
                 call.caller_user,
                 call.caller_display_name,
                 call.from_header,
+                call.event_id,   # #15 pre-computed upstream event id (telemetry)
             )
         except Exception as e:
             logger.error(f"Call callback error for {call.call_id}: {e}")

@@ -308,6 +308,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <th>Attempts</th>
                 <th>Last Error</th>
                 <th>State</th>
+                <th>Event ID</th>
                 {% endif %}
             </tr>
         </thead>
@@ -329,11 +330,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <td>{{ call.attempts if call.attempts is not none else '-' }}</td>
                     <td>{{ call.last_error if call.last_error else '-' }}</td>
                     <td>{{ call.state if call.state else '-' }}</td>
+                    <td>{{ call.event_id if call.event_id else '-' }}</td>
                     {% endif %}
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="{{ 11 if view == 'advanced' else 8 }}" class="empty-msg">No calls recorded yet.</td></tr>
+                <tr><td colspan="{{ 12 if view == 'advanced' else 8 }}" class="empty-msg">No calls recorded yet.</td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -1077,7 +1079,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             writer.writerow([
                 "Time (local)", "Caller ID", "Area", "Room",
                 "TTS String", "State", "Fusion Status",
-                "Time (UTC)", "Fusion Result",
+                "Time (UTC)", "Fusion Result", "Event ID",
             ])
             yield buf.getvalue()
             buf.seek(0)
@@ -1098,6 +1100,7 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                     status if status is not None else "",
                     display_local(r.get("created_at"), "UTC"),
                     _safe(_fusion_result_text(status)),
+                    _safe(r.get("event_id")),   # #15 upstream event id (raw, injection-neutralized)
                 ])
                 yield buf.getvalue()
                 buf.seek(0)

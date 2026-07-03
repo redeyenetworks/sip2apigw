@@ -93,6 +93,7 @@ class SIPGateway:
         caller_user: str,
         display_name: str,
         from_header: str,
+        event_id: str = "",
     ):
         """Callback invoked when a SIP call is answered.
 
@@ -124,6 +125,7 @@ class SIPGateway:
             tts_string=tts,
             sip_call_id=call_id,
             is_test=1 if self._dry_run else 0,
+            event_id=event_id or None,   # #15 persist upstream event id (NULL if absent)
         )
 
         # #5 clinical dedupe — SHADOW/DISABLED. Runs AFTER the record-first

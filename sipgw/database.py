@@ -100,6 +100,13 @@ CREATE_STATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_calls_state ON calls(state)
 """
 
+# #15 upstream event-id index. Makes the (nullable) event_id column a usable
+# merge/dedup key for the #17 HA-Phase-2 prerequisite. Idempotent; created
+# alongside CREATE_STATE_INDEX in _migrate() AFTER the ADD COLUMN runs.
+CREATE_EVENT_ID_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_calls_event_id ON calls(event_id)
+"""
+
 # #7 liveness heartbeat. The writer process stamps beat_at (epoch); the (soon
 # decoupled, #14) dashboard reads it and reports /health stale if it ages out.
 CREATE_HEARTBEAT = """
@@ -133,6 +140,7 @@ _NEW_COLUMNS = [
     ("sip_call_id",  "TEXT"),
     ("duplicate_of", "INTEGER"),                          # #5 dedupe shadow (column now, use later)
     ("is_test",      "INTEGER NOT NULL DEFAULT 0"),
+    ("event_id",     "TEXT"),                             # #15 upstream event id (telemetry; nullable, no backfill)
 ]
 
 # Delivery states.
@@ -233,6 +241,7 @@ class CallDatabase:
                 added.append(name)
 
         await self._db.execute(CREATE_STATE_INDEX)
+        await self._db.execute(CREATE_EVENT_ID_INDEX)   # #15 (runs after ADD COLUMN)
         await self._db.commit()
 
         if added:
@@ -292,11 +301,16 @@ class CallDatabase:
         self, *, caller_id: str, display_name: str,
         area_number: Optional[str], area_name: str, room_number: Optional[str],
         tts_string: str, sip_call_id: Optional[str] = None, is_test: int = 0,
+        event_id: Optional[str] = None,
     ) -> int:
         """Record-first: persist the intent as a PENDING row before delivery.
 
         This is what makes delivery durable — the page survives a crash or a
         Fusion outage between record and send, and the retry worker picks it up.
+
+        ``event_id`` (#15) is the upstream telemetry event id extracted from the
+        SIP Call-ID; nullable and never gates the insert — record-first stays
+        sacred. Stored raw and only ever rendered through autoescape / CSV _safe.
         """
         now = time.time()
         timestamp = _utc_rfc3339(now)
@@ -304,12 +318,12 @@ class CallDatabase:
             """INSERT INTO calls
                (timestamp, caller_id, display_name, area_number, area_name,
                 room_number, tts_string, fusion_status, response_time_ms, created_at,
-                state, attempts, is_test, sip_call_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                state, attempts, is_test, sip_call_id, event_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 timestamp, caller_id, display_name, area_number, area_name,
                 room_number, tts_string, None, None, now,
-                STATE_PENDING, 0, is_test, sip_call_id,
+                STATE_PENDING, 0, is_test, sip_call_id, event_id,
             ),
         )
         await self._db.commit()

@@ -381,6 +381,52 @@ class TestXssSafety:
             assert "&lt;script&gt;alert(&#39;tts&#39;)&lt;/script&gt;" in html
 
 
+class TestEventId:
+    def test_advanced_renders_event_id(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], event_id="EVT7788")
+        mock_db.get_calls_page = AsyncMock(return_value=([row], 1, 1))
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        html = client.get("/?view=advanced").text
+        assert "Event ID" in html      # column header
+        assert "EVT7788" in html       # value from the row
+
+    def test_event_id_hidden_in_summary(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], event_id="EVT7788")
+        mock_db.get_calls_page = AsyncMock(return_value=([row], 1, 1))
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        html = client.get("/?view=summary").text
+        assert "Event ID" not in html
+        assert "EVT7788" not in html
+
+    def test_event_id_autoescaped(self, mock_db, dashboard_config):
+        # event_id originates from an attacker-influenceable SIP Call-ID segment;
+        # it must be rendered inert (autoescape=True), never as live markup.
+        row = dict(SAMPLE_CALLS[0], event_id="<script>alert('e')</script>")
+        mock_db.get_calls_page = AsyncMock(return_value=([row], 1, 1))
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        html = client.get("/?view=advanced").text
+        assert "<script>alert('e')</script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_missing_event_id_key_no_crash(self, client):
+        # SAMPLE_CALLS predate the migration (no event_id key). The advanced
+        # view must still render (Jinja Undefined -> '-'), never 500 — the
+        # dashboard is decoupled and may read a not-yet-migrated DB.
+        r = client.get("/?view=advanced")
+        assert r.status_code == 200
+        assert "a730r201" in r.text
+
+    def test_export_has_event_id_column(self, client):
+        header = client.get("/export.csv").text.splitlines()[0]
+        assert "Event ID" in header
+
+    def test_export_event_id_value(self, mock_db, dashboard_config):
+        row = dict(SAMPLE_CALLS[0], event_id="EVT7788")
+        mock_db.export_calls = AsyncMock(return_value=[row])
+        client = TestClient(create_dashboard(mock_db, dashboard_config))
+        assert "EVT7788" in client.get("/export.csv").text
+
+
 @pytest.mark.asyncio
 async def test_get_calls_between_real_db(tmp_path):
     """#13-P1: get_calls_between returns only is_test=0 rows within [start,end]."""
