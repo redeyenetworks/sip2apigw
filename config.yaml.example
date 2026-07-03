@@ -71,8 +71,21 @@ health:
   # and monitors ONLY — a Fusion blip is deliberately NOT allowed to flip
   # /health to 503; the status code stays keyed solely on heartbeat freshness.
   keepalive_interval_seconds: 300.0
-
-database:
+  # inbound-liveness (sibling of the #7 checks, for the INBOUND / Rauland
+  # direction). Rauland sends SIP only on real Code Blue events — no keepalives —
+  # so the gateway cannot by itself tell "Rauland idle" from "Rauland link down".
+  # The writer stamps the time of the last inbound SIP from an ALLOWED network and
+  # flushes it to the DB every inbound_flush_interval_seconds; the dashboard shows
+  # "Last inbound from Rauland" (amber once older than inbound_stale_after_seconds)
+  # and /health surfaces last_inbound_sip_age_s. These are INFORMATIONAL only — a
+  # normal quiet stretch is NOT allowed to flip /health to 503.
+  inbound_flush_interval_seconds: 30.0
+  inbound_stale_after_seconds: 432000.0     # 5 days -> dashboard turns amber
+  # OPT-IN silence escalation via the escalation webhook below. 0 = OFF (default).
+  # If enabled, keep it ABOVE the historical ~4.27-day (368,837 s) max quiet gap —
+  # recommend >= 432000 (5 days) — or a normal idle stretch will false-alarm. It
+  # fires at most once per silence episode and resets when inbound resumes.
+  inbound_escalate_after_seconds: 0.0       # 0 = OFF
   path: "/var/lib/sipgw/calls.db"
 
 escalation:

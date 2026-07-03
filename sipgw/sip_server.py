@@ -165,6 +165,15 @@ class SIPServer:
         self._running = False
         self._bind_ip = config.sip.bind_ip
         self._local_ip: Optional[str] = None
+        # inbound-liveness: wall-clock epoch of the last SIP request received from
+        # an ALLOWED (Rauland) network. In-memory only; a writer-side loop flushes
+        # it to the DB. None until the first allowed datagram is seen since boot.
+        self._last_inbound_at: Optional[float] = None
+
+    @property
+    def last_inbound_at(self) -> Optional[float]:
+        """Epoch of the last allowed-network inbound SIP request (None if none)."""
+        return self._last_inbound_at
 
     def _get_local_ip(self) -> str:
         """Determine the local IP for SDP and Contact headers."""
@@ -285,6 +294,13 @@ class SIPServer:
                 addr, transport, protocol_type,
             )
             return
+
+        # inbound-liveness: stamp the last-inbound time AFTER the allowlist so only
+        # Rauland-attributable datagrams reset the clock (internet-scan noise on UDP
+        # 5060 is rejected above and cannot mask a real Rauland-side outage). Purely
+        # additive single assignment: no branch, no I/O, no await, cannot raise —
+        # zero behavior change to INVITE/ACK/BYE/CANCEL/OPTIONS handling below.
+        self._last_inbound_at = time.time()
 
         method = msg.method.upper()
         logger.debug(f"Received {method} from {addr[0]}:{addr[1]} ({protocol_type})")

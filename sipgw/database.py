@@ -632,6 +632,38 @@ class CallDatabase:
         row = await cur.fetchone()
         return row[0] if row else None
 
+    # ------------------------------------------------- inbound-liveness (#7 sib)
+    async def write_inbound_seen(self, epoch: float,
+                                 name: str = "inbound_sip") -> float:
+        """Persist the epoch of the last inbound SIP received from Rauland.
+
+        Reuses the existing heartbeat table (no new DDL / migration). Unlike
+        write_heartbeat, it stores the CALLER-SUPPLIED receive epoch (not now())
+        so the flush loop records when the datagram actually arrived. Idempotent
+        UPSERT (single row per ``name``). Returns the stored epoch.
+        """
+        await self._db.execute(
+            "INSERT INTO heartbeat (name, beat_at) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at",
+            (name, epoch),
+        )
+        await self._db.commit()
+        return epoch
+
+    async def read_inbound_seen(self, name: str = "inbound_sip") -> Optional[float]:
+        """Read the last inbound-SIP epoch (None if never stamped).
+
+        SELECT-only, so safe under the dashboard's ``query_only=ON`` connection.
+        Tolerates the heartbeat table not existing yet (older writer): None.
+        """
+        try:
+            cur = await self._db.execute(
+                "SELECT beat_at FROM heartbeat WHERE name=?", (name,))
+            row = await cur.fetchone()
+        except aiosqlite.OperationalError:
+            return None
+        return row[0] if row else None
+
     # ----------------------------------------------------------- #7 keepalive
     async def write_fusion_check(self, ok: bool, detail: str = "",
                                  name: str = "fusion") -> float:

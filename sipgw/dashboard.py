@@ -42,6 +42,18 @@ def _time_context(log_config: Optional["LoggingConfig"]) -> dict:
     return {"server_tz": tz_name or "local", "ts_format": "%Y-%m-%d %H:%M:%S"}
 
 
+def _format_age(seconds: float) -> str:
+    """Compact human age string for the inbound-liveness card (e.g. '3m', '4d')."""
+    s = max(0.0, float(seconds))
+    if s < 90:
+        return f"{int(s)}s"
+    if s < 5400:            # < 90 min
+        return f"{int(s / 60)}m"
+    if s < 172800:          # < 48 h
+        return f"{int(s / 3600)}h"
+    return f"{int(s / 86400)}d"
+
+
 def _plain_status(fusion_status) -> tuple:
     """#13-P1: map a raw Fusion status to (glyph, text, css_class).
 
@@ -284,6 +296,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="stat-card">
             <div class="label">Pending</div>
             <div class="value" style="color: #ff9800;">{{ pending_calls }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Last inbound from Rauland</div>
+            <div class="value" style="color: {{ inbound_color }};">{{ inbound_age_label }}</div>
         </div>
     </div>
 
@@ -971,6 +987,23 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         failed = stats["failed"]
         pending = stats.get("pending", 0)
 
+        # inbound-liveness: last inbound SIP from Rauland (INFORMATIONAL, read-only,
+        # zero SIP impact). Green when fresh, amber once older than
+        # inbound_stale_after_seconds, grey when never seen (writer not yet stamping).
+        inbound_stale_after = getattr(
+            health_config, "inbound_stale_after_seconds", 432000.0)
+        try:
+            inbound_epoch = await db.read_inbound_seen("inbound_sip")
+        except Exception:
+            inbound_epoch = None
+        if isinstance(inbound_epoch, (int, float)):
+            inbound_age_s = max(0.0, time.time() - inbound_epoch)
+            inbound_age_label = _format_age(inbound_age_s)
+            inbound_color = "#ff9800" if inbound_age_s > inbound_stale_after else "#4caf50"
+        else:
+            inbound_age_label = "never"
+            inbound_color = "#888"
+
         # #13: date-picker log viewer. "A day" is the VIEWER's day, defined in the
         # configured display zone (logging.timezone; "" = host). Logs are UTC and
         # rotate at UTC midnight, so a local day is gathered across the overlapping
@@ -1009,6 +1042,8 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             success_calls=success,
             failed_calls=failed,
             pending_calls=pending,
+            inbound_age_label=inbound_age_label,
+            inbound_color=inbound_color,
             page=page,
             total_pages=total_pages,
             auto_refresh=bool(auto),
@@ -1160,6 +1195,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
                     info["fusion_checked_age_s"] = round(time.time() - fc["checked_at"], 1)
             else:
                 info["fusion_reachable"] = None
+        except Exception:
+            pass
+        # inbound-liveness: last inbound SIP from Rauland. INFORMATIONAL only —
+        # like the fusion fields it NEVER flips the /health status code (a normal
+        # quiet Rauland stretch must not 503 the node). isinstance guard keeps a
+        # non-numeric/mocked read from serializing junk; failures are swallowed.
+        try:
+            inbound_at = await db.read_inbound_seen("inbound_sip")
+            if isinstance(inbound_at, (int, float)):
+                info["last_inbound_sip_at"] = inbound_at
+                info["last_inbound_sip_age_s"] = round(time.time() - inbound_at, 1)
+            else:
+                info["last_inbound_sip_at"] = None
         except Exception:
             pass
         return info

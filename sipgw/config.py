@@ -108,6 +108,17 @@ class HealthConfig:
     heartbeat_interval_seconds: float = 10.0
     stale_after_seconds: float = 30.0
     keepalive_interval_seconds: float = 300.0
+    # inbound-liveness (sibling of #7, for the INBOUND/Rauland direction). The
+    # writer flushes the last inbound-SIP time to the DB every
+    # inbound_flush_interval_seconds; the dashboard shows it amber once older than
+    # inbound_stale_after_seconds (INFORMATIONAL only — never gates /health).
+    # inbound_escalate_after_seconds > 0 opts INTO a once-per-episode webhook alert
+    # via the #3 Escalator; 0 = OFF (default). Rauland only sends on real events
+    # (no keepalives) and ~24% of days have zero calls, so the escalation floor is
+    # generous: > the observed ~4.27-day max quiet gap.
+    inbound_flush_interval_seconds: float = 30.0
+    inbound_stale_after_seconds: float = 432000.0      # 5 days (amber threshold)
+    inbound_escalate_after_seconds: float = 0.0        # 0 = OFF (opt-in)
 
 
 @dataclass
@@ -290,6 +301,18 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
             f"health.keepalive_interval_seconds is "
             f"{config.health.keepalive_interval_seconds} (<30s) — the Fusion "
             f"reachability probe may hammer Fusion; consider >= 60s")
+
+    # inbound-liveness silence escalation is OPT-IN (0 = OFF). If enabled, warn
+    # when the threshold sits below the historical max quiet gap (~4.27 days /
+    # 368,837 s over 99 days of real traffic) — a quiet stretch is NORMAL for
+    # Rauland, so a too-low threshold would false-alarm on ordinary idle periods.
+    _INBOUND_QUIET_FLOOR = 432000.0   # 5 days, just above the observed max gap
+    if 0 < config.health.inbound_escalate_after_seconds < _INBOUND_QUIET_FLOOR:
+        warnings.append(
+            f"health.inbound_escalate_after_seconds is "
+            f"{config.health.inbound_escalate_after_seconds} (< {_INBOUND_QUIET_FLOOR:.0f}s "
+            f"~5d) — below the observed ~4.27-day max quiet gap; a normal idle "
+            f"stretch could false-alarm. Consider >= {_INBOUND_QUIET_FLOOR:.0f}s.")
 
     if errors:
         raise ConfigError(

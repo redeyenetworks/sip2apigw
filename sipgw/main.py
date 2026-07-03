@@ -11,6 +11,8 @@ import logging
 import signal
 import sys
 import os
+import time
+from typing import Optional
 
 from .config import load_config, AppConfig
 from .lookups import load_lookups
@@ -52,6 +54,12 @@ class SIPGateway:
         # this writer process no longer serves HTTP.
         self._hb_task = None           # #7 heartbeat writer
         self._keepalive_task = None    # #7 Fusion reachability keepalive
+        self._inbound_flush_task = None    # inbound-liveness DB flush + escalation
+        # inbound-liveness escalation de-dup: the inbound epoch we last alerted on
+        # (None = no active silence episode alerted). Resets implicitly when a
+        # fresher inbound epoch is observed. In-memory only (a restart may re-fire
+        # one alert mid-silence — acceptable given the generous threshold).
+        self._inbound_escalated_for: Optional[float] = None
         self.watchdog = WatchdogPinger()   # #8 systemd watchdog (inert w/o systemd)
         self._shutdown_event = asyncio.Event()
 
@@ -86,6 +94,67 @@ class SIPGateway:
             except Exception:
                 logger.exception("fusion reachability keepalive failed")
             await asyncio.sleep(interval)
+
+    async def _inbound_flush_loop(self):
+        """inbound-liveness: persist the last inbound-SIP time and (opt-in) alert
+        on prolonged Rauland silence.
+
+        Flush: every ``inbound_flush_interval_seconds``, if the in-memory stamp is
+        set, persist it. It NEVER writes when the stamp is None (no allowed-network
+        datagram since boot), so a writer restart during a real silence cannot
+        clobber the persisted last-real value with now()/None.
+
+        Escalation is OPT-IN (``inbound_escalate_after_seconds`` > 0; default 0 =
+        OFF): fires ONCE per silence episode via the no-send-guarded #3 Escalator
+        and never gates anything. Modeled on _heartbeat_loop / _keepalive_loop;
+        every exception is guarded so the loop can never crash the writer.
+        """
+        interval = getattr(self.config.health, "inbound_flush_interval_seconds", 30.0)
+        escalate_after = getattr(
+            self.config.health, "inbound_escalate_after_seconds", 0.0)
+        while True:
+            try:
+                epoch = self.sip_server.last_inbound_at
+                if epoch is not None:
+                    await self.db.write_inbound_seen(epoch)
+                if escalate_after and escalate_after > 0:
+                    await self._maybe_escalate_inbound_silence(epoch, escalate_after)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("inbound-liveness flush loop failed")
+            await asyncio.sleep(interval)
+
+    async def _maybe_escalate_inbound_silence(self, in_memory_epoch, escalate_after):
+        """Fire an inbound-silence alert at most once per episode.
+
+        Reference epoch = the in-memory stamp, or the persisted value after a
+        restart (in-memory None). De-duped by ``_inbound_escalated_for``: we only
+        escalate when the age exceeds the threshold AND we have not already
+        alerted on THIS reference epoch. A fresher inbound epoch changes the
+        reference, so the next silence can alert again. Robust by contract — the
+        Escalator logs and never raises, and any error here is caught by the loop.
+        """
+        ref = in_memory_epoch
+        if ref is None:
+            ref = await self.db.read_inbound_seen()
+        if ref is None:
+            return  # never seen any inbound yet — nothing to alert about
+        age = time.time() - ref
+        if age > escalate_after and self._inbound_escalated_for != ref:
+            self._inbound_escalated_for = ref   # set BEFORE send: no retry-storm
+            await self.escalator.escalate("inbound-silence", {
+                "id": None,
+                "caller_id": "rauland-inbound-link",
+                "area_number": None,
+                "room_number": None,
+                "attempts": None,
+                "fusion_status": None,
+                "tts_string": None,
+                "last_error": (
+                    f"no inbound SIP from Rauland for {age:.0f}s "
+                    f"(threshold {escalate_after:.0f}s)"),
+            })
 
     async def on_call(
         self,
@@ -173,6 +242,9 @@ class SIPGateway:
         # #7 start the Fusion reachability keepalive (additive, read-only, never
         # gates /health and never sends a page).
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        # inbound-liveness: flush the last inbound-SIP time to the DB (additive;
+        # escalation OFF by default). Never gates /health, never sends a page.
+        self._inbound_flush_task = asyncio.create_task(self._inbound_flush_loop())
 
         # #8 tell systemd we are up and start watchdog pings BEFORE recovery.
         # A large recover() must not delay READY (watchdog restart loop); the
@@ -209,6 +281,12 @@ class SIPGateway:
                 self._keepalive_task.cancel()
                 try:
                     await self._keepalive_task
+                except asyncio.CancelledError:
+                    pass
+            if self._inbound_flush_task:
+                self._inbound_flush_task.cancel()
+                try:
+                    await self._inbound_flush_task
                 except asyncio.CancelledError:
                     pass
             await self.webhook.close()
