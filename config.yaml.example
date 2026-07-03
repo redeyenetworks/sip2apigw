@@ -71,6 +71,21 @@ health:
   # and monitors ONLY — a Fusion blip is deliberately NOT allowed to flip
   # /health to 503; the status code stays keyed solely on heartbeat freshness.
   keepalive_interval_seconds: 300.0
+  # #7 OPT-IN degraded /health signal for the Fusion-unreachable probe above.
+  # Default false: /health stays heartbeat-only (fusion_reachable stays purely
+  # informational, exactly as today). Set true ONLY if you deliberately want a
+  # Fusion outage to make /health return 503 status='fusion-unreachable'.
+  # TRADEOFF (read carefully): with a single node behind an LB/monitor, a
+  # transient Fusion blip CAN then 503 the node and get it pulled or restarted —
+  # the exact scenario the default-off protects against. Keep it FALSE outside
+  # production (dry-run/test probes reach no real host). Only a PRESENT + FRESH
+  # ok=False probe degrades; a never-run or stale check stays 200 (fail-safe).
+  fail_on_fusion_unreachable: false
+  # Freshness bound for the degrade above (seconds). 0.0 = auto: derived from the
+  # probe cadence (keepalive_interval_seconds * 2 + stale_after_seconds) so a
+  # normally-aged check is never mistaken for stale. Only a check newer than this
+  # can degrade /health.
+  fusion_unreachable_max_age_seconds: 0.0
   # inbound-liveness (sibling of the #7 checks, for the INBOUND / Rauland
   # direction). Rauland sends SIP only on real Code Blue events — no keepalives —
   # so the gateway cannot by itself tell "Rauland idle" from "Rauland link down".

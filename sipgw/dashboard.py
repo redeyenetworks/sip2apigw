@@ -1167,6 +1167,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         )
 
     stale_after = getattr(health_config, "stale_after_seconds", 30.0)
+    # #7 opt-in Fusion-unreachable degrade (default OFF). When enabled, only a
+    # PRESENT + FRESH ok=False probe degrades /health; None and STALE checks stay
+    # 200 (fail-safe). Freshness bound: explicit config, else auto-derived from
+    # the probe cadence so a normally-aged check is never mistaken for stale.
+    fail_on_fusion_unreachable = getattr(
+        health_config, "fail_on_fusion_unreachable", False)
+    _fusion_max_age_cfg = getattr(
+        health_config, "fusion_unreachable_max_age_seconds", 0.0) or 0.0
+    if _fusion_max_age_cfg > 0:
+        fusion_max_age = _fusion_max_age_cfg
+    else:
+        _keepalive = getattr(health_config, "keepalive_interval_seconds", 300.0)
+        fusion_max_age = _keepalive * 2 + stale_after
 
     async def _health_info() -> dict:
         """#7 INFORMATIONAL /health fields read from the shared DB.
@@ -1226,7 +1239,24 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             return JSONResponse(status_code=503,
                                 content={"status": "stale", "heartbeat_age_s": round(age, 1)})
         body = {"status": "ok", "heartbeat_age_s": round(age, 1)}
-        body.update(await _health_info())
+        info = await _health_info()
+        body.update(info)
+        # #7 opt-in degrade — runs ONLY after the heartbeat gate above passes, so
+        # a dead writer always reports 'stale'/'no-heartbeat' and is never masked
+        # as a Fusion problem (heartbeat stays the sole liveness authority). Only
+        # a PRESENT + FRESH ok=False probe degrades; None (unknown) and STALE
+        # checks fall through to 200.
+        if fail_on_fusion_unreachable:
+            reachable = info.get("fusion_reachable")
+            checked_age = info.get("fusion_checked_age_s")
+            if reachable is False and isinstance(checked_age, (int, float)) \
+                    and checked_age <= fusion_max_age:
+                return JSONResponse(status_code=503, content={
+                    "status": "fusion-unreachable",
+                    "heartbeat_age_s": round(age, 1),
+                    "fusion_detail": info.get("fusion_detail"),
+                    "fusion_checked_age_s": checked_age,
+                })
         return body
 
     return app

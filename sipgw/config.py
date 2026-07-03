@@ -108,6 +108,18 @@ class HealthConfig:
     heartbeat_interval_seconds: float = 10.0
     stale_after_seconds: float = 30.0
     keepalive_interval_seconds: float = 300.0
+    # #7 OPT-IN degraded /health signal for a Fusion-unreachable probe. Default
+    # OFF: /health stays byte-for-byte heartbeat-only (fusion result is purely
+    # informational). When True, a PRESENT + FRESH ok=False probe makes /health
+    # return 503 status='fusion-unreachable' — this intentionally lets a Fusion
+    # blip 503 the node (and, if wired to an LB/monitor, pull/restart it), so it
+    # is the operator's explicit opt-in. None (never stamped / older writer) and
+    # STALE checks are treated as unknown and NEVER degrade (fail-safe).
+    fail_on_fusion_unreachable: bool = False
+    # Freshness bound for the degrade above. 0.0 = auto: derive from the probe
+    # cadence (keepalive_interval * 2 + stale_after) so a normally-aged check is
+    # never wrongly read as stale. Only a check newer than this can degrade.
+    fusion_unreachable_max_age_seconds: float = 0.0
     # inbound-liveness (sibling of #7, for the INBOUND/Rauland direction). The
     # writer flushes the last inbound-SIP time to the DB every
     # inbound_flush_interval_seconds; the dashboard shows it amber once older than
@@ -301,6 +313,19 @@ def validate_config(config: AppConfig, dry_run: bool) -> List[str]:
             f"health.keepalive_interval_seconds is "
             f"{config.health.keepalive_interval_seconds} (<30s) — the Fusion "
             f"reachability probe may hammer Fusion; consider >= 60s")
+
+    # #7 opt-in Fusion-unreachable degrade. Non-fatal foot-gun guard: if the flag
+    # is enabled but the keepalive probe is disabled (<=0), no FRESH ok=False
+    # check is ever stamped, so the degrade can never fire — the operator has a
+    # false sense of protection. Warn (never raise; dedupe #5 stays the sole
+    # enforcement-fatal).
+    if config.health.fail_on_fusion_unreachable and \
+            config.health.keepalive_interval_seconds <= 0:
+        warnings.append(
+            "health.fail_on_fusion_unreachable is True but "
+            "health.keepalive_interval_seconds <= 0 disables the reachability "
+            "probe — no fresh check will ever be stamped, so /health can never "
+            "signal 'fusion-unreachable'. Enable the keepalive or clear the flag.")
 
     # inbound-liveness silence escalation is OPT-IN (0 = OFF). If enabled, warn
     # when the threshold sits below the historical max quiet gap (~4.27 days /

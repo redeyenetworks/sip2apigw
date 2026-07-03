@@ -151,6 +151,41 @@ health:
 `503 {"status":"stale",...}` (heartbeat too old), or
 `503 {"status":"no-heartbeat"}` (never stamped — writer down).
 
+The heartbeat is the **sole** default liveness authority. The Fusion
+reachability probe result (`fusion_reachable`, `fusion_detail`,
+`fusion_checked_age_s`) is surfaced in the `/health` body as **informational
+only** and, by default, never changes the status code.
+
+**Opt-in Fusion-unreachable degrade (default OFF).** For operators who *want* a
+Fusion outage reflected in the `/health` status code:
+
+```yaml
+health:
+  fail_on_fusion_unreachable: false     # default OFF — heartbeat-only, unchanged
+  fusion_unreachable_max_age_seconds: 0.0   # 0 = auto (keepalive*2 + stale_after)
+```
+
+When `fail_on_fusion_unreachable: true`, a **present and fresh** `ok=False`
+reachability probe makes `/health` return
+`503 {"status":"fusion-unreachable", "fusion_detail":..., "fusion_checked_age_s":...}`.
+
+Fail-safe design (unknown is never unreachable):
+
+- The heartbeat gate runs **first** — a dead writer still reports `stale` /
+  `no-heartbeat`, never masked as a Fusion problem.
+- A **never-stamped or older-writer** check (`fusion_reachable: null`) stays
+  **200**.
+- A **stale** check (older than the freshness bound) stays **200** — a stuck or
+  old probe can never degrade the node.
+
+**TRADEOFF — read before enabling:** on a single node behind a load balancer or
+monitor, a transient Fusion blip can then 503 the node and get it pulled or
+restarted — the exact scenario the default-off protects against. Keep it
+**false** outside production (dry-run/test probes reach no real host). If the
+flag is on but the keepalive probe is disabled (`keepalive_interval_seconds
+<= 0`), `validate_config` emits a **non-fatal warning** because no fresh check
+is ever stamped, so the degrade can never fire.
+
 ### Dedupe Section (#5 — SHADOW/DISABLED)
 
 **Clinical dedupe ships inert and must stay that way.** It computes a *clinical*

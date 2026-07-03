@@ -122,7 +122,10 @@ class TestFusionCheckDB:
         await db.close()
 
 
-def _client(beat, stale_after=30.0, fusion=None, snapshot=None):
+def _client(beat, stale_after=30.0, fusion=None, snapshot=None,
+            fail_on_fusion_unreachable=False,
+            fusion_unreachable_max_age_seconds=0.0,
+            keepalive_interval_seconds=300.0):
     db = AsyncMock(spec=CallDatabase)
     db.read_heartbeat = AsyncMock(return_value=beat)
     db.read_fusion_check = AsyncMock(return_value=fusion)
@@ -131,7 +134,11 @@ def _client(beat, stale_after=30.0, fusion=None, snapshot=None):
         "last_failed_at": None, "last_error": None,
     })
     app = create_dashboard(db, DashboardConfig(),
-                           health_config=HealthConfig(stale_after_seconds=stale_after))
+                           health_config=HealthConfig(
+                               stale_after_seconds=stale_after,
+                               keepalive_interval_seconds=keepalive_interval_seconds,
+                               fail_on_fusion_unreachable=fail_on_fusion_unreachable,
+                               fusion_unreachable_max_age_seconds=fusion_unreachable_max_age_seconds))
     return TestClient(app)
 
 
@@ -177,6 +184,78 @@ class TestHealthEndpoint:
         j = r.json()
         assert r.status_code == 200
         assert j["fusion_reachable"] is None
+
+
+class TestFusionUnreachableDegrade:
+    """#7 opt-in, config-gated /health degrade (default OFF)."""
+
+    def test_default_off_fresh_fail_stays_200(self):
+        # Guards test_keepalive_failure_does_not_flip_status: with the flag OFF,
+        # a fresh ok=False probe MUST NOT change the 200 status.
+        fusion = {"ok": False, "checked_at": time.time() - 5,
+                  "detail": "ConnectError: no route"}
+        r = _client(time.time(), fusion=fusion).get("/health")
+        j = r.json()
+        assert r.status_code == 200 and j["status"] == "ok"
+        assert j["fusion_reachable"] is False
+
+    def test_on_fresh_fail_is_503_fusion_unreachable(self):
+        fusion = {"ok": False, "checked_at": time.time() - 5,
+                  "detail": "ConnectError: no route"}
+        r = _client(time.time(), fusion=fusion,
+                    fail_on_fusion_unreachable=True).get("/health")
+        j = r.json()
+        assert r.status_code == 503 and j["status"] == "fusion-unreachable"
+        assert "ConnectError" in j["fusion_detail"]
+        assert j["fusion_checked_age_s"] >= 0
+
+    def test_on_none_check_stays_200(self):
+        # Never stamped / older writer (read_fusion_check -> None): unknown is
+        # NOT unreachable, so /health stays 200.
+        r = _client(time.time(), fusion=None,
+                    fail_on_fusion_unreachable=True).get("/health")
+        j = r.json()
+        assert r.status_code == 200 and j["status"] == "ok"
+        assert j["fusion_reachable"] is None
+
+    def test_on_stale_fail_stays_200(self):
+        # A stuck/old ok=False probe beyond the freshness bound must NOT degrade.
+        # Auto bound = keepalive*2 + stale_after = 60*2 + 30 = 150s; use 10000s.
+        fusion = {"ok": False, "checked_at": time.time() - 10000,
+                  "detail": "ConnectError: no route"}
+        r = _client(time.time(), fusion=fusion,
+                    fail_on_fusion_unreachable=True,
+                    keepalive_interval_seconds=60.0).get("/health")
+        j = r.json()
+        assert r.status_code == 200 and j["status"] == "ok"
+
+    def test_on_fresh_fail_within_explicit_max_age_is_503(self):
+        fusion = {"ok": False, "checked_at": time.time() - 40,
+                  "detail": "boom"}
+        r = _client(time.time(), fusion=fusion,
+                    fail_on_fusion_unreachable=True,
+                    fusion_unreachable_max_age_seconds=60.0).get("/health")
+        assert r.status_code == 503 and r.json()["status"] == "fusion-unreachable"
+
+    def test_on_ok_check_stays_200(self):
+        fusion = {"ok": True, "checked_at": time.time() - 5, "detail": "HTTP 200"}
+        r = _client(time.time(), fusion=fusion,
+                    fail_on_fusion_unreachable=True).get("/health")
+        j = r.json()
+        assert r.status_code == 200 and j["status"] == "ok"
+        assert j["fusion_reachable"] is True
+
+    def test_heartbeat_stale_still_wins_with_flag_on(self):
+        # Heartbeat gate stays authoritative: a dead writer reports 'stale', not
+        # masked as a Fusion problem, even with a fresh ok=False probe present.
+        fusion = {"ok": False, "checked_at": time.time() - 5, "detail": "boom"}
+        r = _client(time.time() - 999, fusion=fusion,
+                    fail_on_fusion_unreachable=True).get("/health")
+        assert r.status_code == 503 and r.json()["status"] == "stale"
+
+    def test_no_heartbeat_still_wins_with_flag_on(self):
+        r = _client(None, fail_on_fusion_unreachable=True).get("/health")
+        assert r.status_code == 503 and r.json()["status"] == "no-heartbeat"
 
 
 def _real_host_config(**overrides) -> FusionConfig:

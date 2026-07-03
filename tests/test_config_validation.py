@@ -124,6 +124,40 @@ class TestKeepaliveInterval:
         assert config.load_warnings == []          # known key, no typo warning
 
 
+class TestFailOnFusionUnreachable:
+    """#7 opt-in degrade flag — additive; default OFF; never fatal."""
+
+    def test_default_off_no_warning(self):
+        warnings = validate_config(_prod_ok(), dry_run=False)
+        assert not any("fail_on_fusion_unreachable" in w for w in warnings)
+
+    def test_on_with_probe_enabled_no_warning(self):
+        c = _prod_ok()
+        c.health.fail_on_fusion_unreachable = True   # keepalive default 300s
+        warnings = validate_config(c, dry_run=False)
+        assert not any("fail_on_fusion_unreachable" in w for w in warnings)
+
+    def test_on_with_probe_disabled_warns_not_fatal(self):
+        c = _prod_ok()
+        c.health.fail_on_fusion_unreachable = True
+        c.health.keepalive_interval_seconds = 0.0    # probe disabled
+        warnings = validate_config(c, dry_run=False)  # must not raise
+        assert any("fail_on_fusion_unreachable" in w for w in warnings)
+
+    def test_flags_loaded_from_yaml(self, tmp_path):
+        import textwrap
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""
+            health:
+              fail_on_fusion_unreachable: true
+              fusion_unreachable_max_age_seconds: 90.0
+        """))
+        config = load_config(str(p))
+        assert config.health.fail_on_fusion_unreachable is True
+        assert config.health.fusion_unreachable_max_age_seconds == 90.0
+        assert config.load_warnings == []          # known keys, no typo warning
+
+
 class TestUnknownKeyWarnings:
     """#9 remaining acceptance criterion: unknown/misspelled keys are surfaced
     as non-fatal startup warnings (and still dropped, not applied)."""
