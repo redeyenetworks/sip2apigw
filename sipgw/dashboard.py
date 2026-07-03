@@ -1577,8 +1577,9 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         Read-only, zero SIP-path code. The DB row's sip_call_id (written by #2)
         is the AUTHORITATIVE key: the SIP-log and main-log joins are EXACT
         Call-ID matches; the api_debug panel is a clearly-labelled heuristic.
-        Unknown id -> 404 (never 500); a non-int path -> FastAPI 422. A [TEST]
-        row (is_test=1) is shown read-only but badged, never silently excluded.
+        Unknown id -> 404 (never 500); a non-int path -> FastAPI 422. A dry-run
+        [TEST] row (is_test=1; never present in prod) is treated as not found, so
+        the detail view keeps the same is_test=0 discipline as the rest of the UI.
         """
         tz_name = log_config.timezone if log_config else ""
         # Preserve the caller's table state for "Back to all calls"; default "/".
@@ -1589,7 +1590,10 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         except Exception:
             logger.exception("call_detail: get_call(%s) failed", call_id)
             call = None
-        if not call:
+        # Operator-facing view keeps the strict is_test=0 discipline of the list /
+        # table / stats / chart / CSV: a dry-run/test row (never present in prod)
+        # is treated as not found rather than rendered.
+        if not call or call.get("is_test"):
             html = notfound_template.render(call_id=call_id, back_href=back_href)
             return HTMLResponse(content=html, status_code=404)
 

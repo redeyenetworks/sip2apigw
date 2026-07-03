@@ -631,11 +631,12 @@ class TestCallDetail:
         assert "No API delivery block found" in html
 
     # --- [TEST] badge ----------------------------------------------------
-    def test_test_row_badge(self, tmp_path):
+    def test_test_row_hidden_as_404(self, tmp_path):
+        # A dry-run/test row (never present in prod) is treated as not found, so
+        # the detail view keeps the same is_test=0 discipline as the rest of the UI.
         c = self._client(tmp_path, self._row(is_test=1),
                          sip_log=self._sip_log())
-        html = c.get("/call/303").text
-        assert "[TEST]" in html
+        assert c.get("/call/303").status_code == 404
 
     # --- table rows link to /call/{id} -----------------------------------
     def test_table_rows_link_to_detail(self, client):
