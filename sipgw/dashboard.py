@@ -253,11 +253,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="header-row">
         <div class="subtitle">
-            Showing {{ calls|length }} of {{ total_calls }} calls (today)
+            Showing {{ calls|length }} of {{ total_calls }} calls ({% if selected_date %}{{ selected_date }}{% if is_live %} &middot; today{% endif %}{% else %}today{% endif %})
             &bull; Page {{ page }} of {{ total_pages }}
         </div>
         <div class="controls">
-            <a class="view-toggle" href="?view={% if view == 'advanced' %}summary{% else %}advanced{% endif %}&amp;page={{ page }}&amp;auto={{ '1' if auto_refresh else '0' }}&amp;refresh={{ refresh_seconds }}">{% if view == 'advanced' %}Summary view{% else %}Advanced view{% endif %}</a>
+            <a class="view-toggle" href="?view={% if view == 'advanced' %}summary{% else %}advanced{% endif %}&amp;page={{ page }}&amp;auto={{ '1' if auto_refresh else '0' }}&amp;refresh={{ refresh_seconds }}{% if selected_date and not is_live %}&amp;logdate={{ selected_date }}{% endif %}">{% if view == 'advanced' %}Summary view{% else %}Advanced view{% endif %}</a>
             <a class="view-toggle" href="/export.csv">Export CSV</a>
             <label for="timeMode">Time</label>
             <select id="timeMode" aria-label="Time display mode">
@@ -359,7 +359,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     {% if total_pages > 1 %}
     <div class="pagination">
         {% if page > 1 %}
-            <a href="?page={{ page - 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">&laquo; Prev</a>
+            <a href="?page={{ page - 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}{% if selected_date and not is_live %}&logdate={{ selected_date }}{% endif %}">&laquo; Prev</a>
         {% else %}
             <span class="disabled">&laquo; Prev</span>
         {% endif %}
@@ -368,7 +368,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             {% if p == page %}
                 <span class="current">{{ p }}</span>
             {% elif p <= 3 or p > total_pages - 2 or (p >= page - 1 and p <= page + 1) %}
-                <a href="?page={{ p }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">{{ p }}</a>
+                <a href="?page={{ p }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}{% if selected_date and not is_live %}&logdate={{ selected_date }}{% endif %}">{{ p }}</a>
             {% elif p == 4 and page > 5 %}
                 <span class="disabled">&hellip;</span>
             {% elif p == total_pages - 2 and page < total_pages - 4 %}
@@ -377,7 +377,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         {% endfor %}
 
         {% if page < total_pages %}
-            <a href="?page={{ page + 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}">Next &raquo;</a>
+            <a href="?page={{ page + 1 }}&auto={{ '1' if auto_refresh else '0' }}&refresh={{ refresh_seconds }}&view={{ view }}{% if selected_date and not is_live %}&logdate={{ selected_date }}{% endif %}">Next &raquo;</a>
         {% else %}
             <span class="disabled">Next &raquo;</span>
         {% endif %}
@@ -967,13 +967,49 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         if view not in ("summary", "advanced"):
             view = "summary"
         page_size = config.page_size
-        calls, total_calls, total_pages = await db.get_calls_page(
-            page=page, page_size=page_size, today_only=True,
-        )
 
         # #12: stored timestamps are UTC; nurses see local wall time derived
         # from the canonical created_at epoch (not the raw stored string).
         tz_name = log_config.timezone if log_config else ""   # "" = host local
+
+        # F1: the date picker drives BOTH the call table and the log viewer. "A
+        # day" is the display-zone (logging.timezone) LOCAL day. available_dates
+        # comes from log coverage; the default/live view is the latest available
+        # day (today). When a day is selected we read the call table from that
+        # same local-day window via the read-only get_calls_between (which already
+        # enforces 'AND is_test=0') and paginate in Python, so the table and the
+        # logs share one source of truth for "the selected day". If there is no
+        # log coverage at all (selected_date is None) we preserve the original
+        # today-only path so behaviour is unchanged on a fresh install.
+        available_dates = _available_log_days(str(log_dir), log_bases, tz_name)
+        if logdate and logdate in available_dates:
+            selected_date = logdate
+        else:
+            selected_date = available_dates[-1] if available_dates else None
+        is_live = bool(available_dates) and selected_date == available_dates[-1]
+
+        calls = total_calls = total_pages = None
+        if selected_date:
+            try:
+                day_start, day_end = _local_day_window(selected_date, tz_name)
+                # get_calls_between is inclusive on both bounds; nudge the end a
+                # hair under the next-day boundary to match the log viewer's
+                # [start, end) local-day semantics.
+                day_rows = list(await db.get_calls_between(day_start, day_end - 1e-6))
+                total_calls = len(day_rows)
+                total_pages = max(1, (total_calls + page_size - 1) // page_size)
+                offset = (page - 1) * page_size
+                calls = day_rows[offset:offset + page_size]
+            except Exception:
+                logger.exception(
+                    "F1: day-window call table failed; falling back to today")
+                calls = total_calls = total_pages = None
+                selected_date = None
+                is_live = False
+        if calls is None:
+            calls, total_calls, total_pages = await db.get_calls_page(
+                page=page, page_size=page_size, today_only=True,
+            )
         for c in calls:
             c["display_time"] = display_local(c.get("created_at"), tz_name)
             # #13-P1: plain-language delivery status (glyph + text + aria-label).
@@ -1008,14 +1044,11 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         # configured display zone (logging.timezone; "" = host). Logs are UTC and
         # rotate at UTC midnight, so a local day is gathered across the overlapping
         # UTC file(s) and filtered by each entry's timestamp (decompression cached).
-        tz_name_logs = log_config.timezone if log_config else ""
+        # F1: available_dates / selected_date / is_live were resolved up-front so
+        # the CALL TABLE above shares this exact day selection; here we just render
+        # the zone label and read the logs for the same selected_date.
+        tz_name_logs = tz_name
         tz_label = str(_resolve_tz(tz_name_logs))
-        available_dates = _available_log_days(str(log_dir), log_bases, tz_name_logs)
-        if logdate and logdate in available_dates:
-            selected_date = logdate
-        else:
-            selected_date = available_dates[-1] if available_dates else None
-        is_live = bool(available_dates) and selected_date == available_dates[-1]
 
         if selected_date:
             log_lines = _read_log_for_day(str(log_dir), "sipgw.log", selected_date, tz_name_logs)

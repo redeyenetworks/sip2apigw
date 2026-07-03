@@ -46,6 +46,20 @@ SAMPLE_CALLS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_log_days(monkeypatch):
+    """These tests exercise the today / get_calls_page call-table path.
+
+    F1 routes the call table through get_calls_between whenever the display zone
+    has log coverage (a selectable day). This suite constructs dashboards without
+    an isolated log dir, so it would otherwise pick up the host's ambient
+    /var/log/sipgw coverage and flip to the date-window path. Force "no log
+    coverage" so selected_date is None and the classic today path is exercised;
+    the date-picker/window behaviour is covered in test_log_viewer/test_dashboard_f1.
+    """
+    monkeypatch.setattr("sipgw.dashboard._available_log_days", lambda *a, **k: [])
+
+
 @pytest.fixture
 def mock_db():
     db = AsyncMock(spec=CallDatabase)
