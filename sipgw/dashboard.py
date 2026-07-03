@@ -5,9 +5,11 @@ log viewers, and health endpoint. No authentication required.
 """
 
 import os
+import re
 import csv
 import io
 import time
+import tarfile
 import logging
 import yaml
 from pathlib import Path
@@ -15,7 +17,9 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, StreamingResponse
 from typing import Optional
 
-from .database import CallDatabase, display_local
+from datetime import datetime, timezone as _tz, timedelta, date as _date
+
+from .database import CallDatabase, display_local, _resolve_tz
 from .config import DashboardConfig, LoggingConfig
 
 logger = logging.getLogger("sipgw.dashboard")
@@ -362,7 +366,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     {% endif %}
 
-    <h2 style="color: #00d4ff; margin-top: 30px; margin-bottom: 10px; font-size: 1.2rem;">Recent Logs</h2>
+    <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:30px; margin-bottom:10px; flex-wrap:wrap; gap:8px;">
+        <h2 style="color: #00d4ff; font-size: 1.2rem; margin:0;">Logs{% if selected_date %} — <span style="font-weight:normal; font-size:0.85rem; color:{% if is_live %}#6ee7a8{% else %}#ffcc80{% endif %};">{{ selected_date }}{% if is_live %} (live){% else %} (historical){% endif %}</span>{% endif %}</h2>
+        <form method="get" style="display:flex; align-items:center; gap:8px; font-size:0.8rem;">
+            <input type="hidden" name="view" value="{{ view }}">
+            <label style="color:#aaa;">Log date <span style="color:#666;">({{ tz_label }})</span>
+                <input type="date" name="logdate" value="{{ selected_date or '' }}"
+                       {% if available_dates %}min="{{ available_dates[0] }}" max="{{ available_dates[-1] }}"{% endif %}
+                       list="sipgw-log-dates" onchange="this.form.submit()"
+                       style="background:#16213e; color:#e0e0e0; border:1px solid #0f3460; border-radius:4px; padding:3px 6px; font-size:0.8rem;">
+            </label>
+            <datalist id="sipgw-log-dates">{% for d in available_dates %}<option value="{{ d }}"></option>{% endfor %}</datalist>
+            {% if not is_live %}<a class="view-toggle" href="?view={{ view }}">&#8635; Live</a>{% endif %}
+        </form>
+    </div>
     <div class="log-panel">
         <button class="copy-btn" onclick="copyLog(this)">Copy</button>
         <pre style="background: #0d1117; border: 1px solid #0f3460; border-radius: 8px; padding: 15px; font-size: 0.78rem; line-height: 1.5; overflow-x: auto; max-height: 600px; overflow-y: auto; color: #c9d1d9; white-space: pre-wrap; word-wrap: break-word;">{% if log_lines %}{% for line in log_lines %}{{ line }}
@@ -768,6 +785,135 @@ def _read_log_tail(log_path: str, num_lines: int = 50) -> list[str]:
         return []
 
 
+_LOG_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Leading log stamp — new UTC "2026-07-03T00:02:48.827Z" and legacy space form
+# "2026-07-02 10:33:08" (host is UTC, so both are wall-clock UTC).
+_LOG_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+
+# Decompression cache — rotated .tgz files are immutable once written, so keying
+# on (path, mtime) lets repeated views/refreshes reuse the decompressed lines
+# instead of re-"unstuffing" the archive every time.
+_TGZ_CACHE: dict = {}
+
+
+def _line_epoch(line: str):
+    """UTC epoch of a log line's leading timestamp, or None (continuation line)."""
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        y, mo, d, h, mi, s = (int(x) for x in m.groups())
+        return datetime(y, mo, d, h, mi, s, tzinfo=_tz.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_file_lines(path: str) -> list:
+    """Read a log file's lines; transparently (and cache-) decompress a .tgz."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        if str(p).endswith(".tgz"):
+            key = (str(p), p.stat().st_mtime)
+            hit = _TGZ_CACHE.get(key)
+            if hit is not None:
+                return hit
+            with tarfile.open(p, "r:gz") as tar:
+                members = tar.getmembers()
+                lines = (tar.extractfile(members[0]).read()
+                         .decode("utf-8", errors="replace").splitlines()) if members else []
+            if len(_TGZ_CACHE) > 32:
+                _TGZ_CACHE.clear()
+            _TGZ_CACHE[key] = lines
+            return lines
+        with open(p, "rb") as f:
+            return f.read(8 * 1024 * 1024).decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        logger.exception("Failed to read log %s", path)
+        return []
+
+
+def _local_day_window(local_date: str, tzname: str):
+    """[start, end) UTC epochs for one YYYY-MM-DD in tzname (DST-correct)."""
+    tz = _resolve_tz(tzname)
+    y, mo, d = (int(x) for x in local_date.split("-"))
+    start = datetime(y, mo, d, tzinfo=tz).timestamp()
+    nd = _date(y, mo, d) + timedelta(days=1)
+    end = datetime(nd.year, nd.month, nd.day, tzinfo=tz).timestamp()
+    return start, end
+
+
+def _available_log_days(log_dir: str, bases: list, tzname: str) -> list:
+    """Local (tzname) calendar days that have any log coverage, ascending.
+
+    Rotated archives are mapped from their UTC filename date to the local day(s)
+    they touch WITHOUT decompressing (avoids unstuffing every archive just to
+    build the picker); live files are scanned for their line dates.
+    """
+    tz = _resolve_tz(tzname)
+    d = Path(log_dir)
+    days = set()
+    for base in bases:
+        for p in d.glob(base + ".*.tgz"):
+            m = re.search(r"\.(\d{4}-\d{2}-\d{2})\.tgz$", p.name)
+            if not m:
+                continue
+            uy, um, ud = (int(x) for x in m.group(1).split("-"))
+            for hh in (0, 23):   # both ends of the UTC day -> its local day(s)
+                ep = datetime(uy, um, ud, hh, tzinfo=_tz.utc).timestamp()
+                days.add(datetime.fromtimestamp(ep, tz).strftime("%Y-%m-%d"))
+        cur = d / base
+        if cur.exists():
+            for ln in _read_file_lines(str(cur)):
+                ep = _line_epoch(ln)
+                if ep is not None:
+                    days.add(datetime.fromtimestamp(ep, tz).strftime("%Y-%m-%d"))
+    return sorted(days)
+
+
+def _read_log_for_day(log_dir: str, base: str, local_date: str, tzname: str,
+                      num_lines: int = 400) -> list:
+    """Lines for one stream on one LOCAL day, gathered across the UTC file(s)
+    that overlap the day's window and filtered by each entry's UTC timestamp.
+
+    Multi-line entries (a timestamped line + its continuations) are kept/dropped
+    as a unit by the leading timestamp. Never raises.
+    """
+    if not _LOG_DATE_RE.match(local_date or ""):
+        return []
+    try:
+        start, end = _local_day_window(local_date, tzname)
+    except Exception:
+        return []
+    d = Path(log_dir)
+    # UTC dates the window overlaps (usually 2).
+    sd = datetime.fromtimestamp(start, _tz.utc).date()
+    ed = datetime.fromtimestamp(end - 1, _tz.utc).date()
+    files, need_live = [], False
+    dd = sd
+    while dd <= ed:
+        tgz = d / f"{base}.{dd.strftime('%Y-%m-%d')}.tgz"
+        if tgz.exists():
+            files.append(str(tgz))
+        else:
+            need_live = True
+        dd += timedelta(days=1)
+    live = d / base
+    if need_live and live.exists():
+        files.append(str(live))
+
+    out, keep = [], False
+    for f in files:
+        for ln in _read_file_lines(f):
+            ep = _line_epoch(ln)
+            if ep is not None:
+                keep = (start <= ep < end)
+            if keep:
+                out.append(ln)
+    return out[-num_lines:]
+
+
 def create_dashboard(db: CallDatabase, config: DashboardConfig,
                      log_config: Optional[LoggingConfig] = None,
                      health_config=None) -> FastAPI:
@@ -785,12 +931,19 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
     api_debug_enabled = log_config.api_debug_log if log_config else False
     sip_debug_enabled = log_config.sip_debug_log if log_config else False
 
+    log_bases = ["sipgw.log"]
+    if sip_debug_enabled:
+        log_bases.append("sipgw_sip_debug.log")
+    if api_debug_enabled:
+        log_bases.append("sipgw_api_debug.log")
+
     @app.get("/", response_class=HTMLResponse)
     async def index(
         page: int = Query(1, ge=1),
         auto: int = Query(0, ge=0, le=1),
         refresh: int = Query(config.auto_refresh_seconds),
         view: str = Query("summary"),
+        logdate: Optional[str] = Query(None),
     ):
         # #13-P1: invalid view value falls back to summary (never a 500).
         if view not in ("summary", "advanced"):
@@ -816,9 +969,33 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
         failed = stats["failed"]
         pending = stats.get("pending", 0)
 
-        log_lines = _read_log_tail(log_file)
-        api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
-        sip_debug_lines = _read_log_tail(sip_debug_file) if sip_debug_enabled else None
+        # #13: date-picker log viewer. "A day" is the VIEWER's day, defined in the
+        # configured display zone (logging.timezone; "" = host). Logs are UTC and
+        # rotate at UTC midnight, so a local day is gathered across the overlapping
+        # UTC file(s) and filtered by each entry's timestamp (decompression cached).
+        tz_name_logs = log_config.timezone if log_config else ""
+        tz_label = str(_resolve_tz(tz_name_logs))
+        available_dates = _available_log_days(str(log_dir), log_bases, tz_name_logs)
+        if logdate and logdate in available_dates:
+            selected_date = logdate
+        else:
+            selected_date = available_dates[-1] if available_dates else None
+        is_live = bool(available_dates) and selected_date == available_dates[-1]
+
+        if selected_date:
+            log_lines = _read_log_for_day(str(log_dir), "sipgw.log", selected_date, tz_name_logs)
+            api_debug_lines = (_read_log_for_day(str(log_dir), "sipgw_api_debug.log", selected_date, tz_name_logs)
+                               if api_debug_enabled else None)
+            sip_debug_lines = (_read_log_for_day(str(log_dir), "sipgw_sip_debug.log", selected_date, tz_name_logs)
+                               if sip_debug_enabled else None)
+        else:
+            log_lines = _read_log_tail(log_file)
+            api_debug_lines = _read_log_tail(api_debug_file) if api_debug_enabled else None
+            sip_debug_lines = _read_log_tail(sip_debug_file) if sip_debug_enabled else None
+
+        # Auto-refresh only makes sense on the live view, not historical logs.
+        if not is_live:
+            auto = 0
 
         # Clamp refresh to allowed values
         if refresh not in (10, 30, 60, 120, 300):
@@ -838,6 +1015,10 @@ def create_dashboard(db: CallDatabase, config: DashboardConfig,
             log_lines=log_lines,
             api_debug_lines=api_debug_lines,
             sip_debug_lines=sip_debug_lines,
+            available_dates=available_dates,
+            selected_date=selected_date,
+            is_live=is_live,
+            tz_label=tz_label,
             time_ctx=_time_context(log_config),
         )
         return HTMLResponse(content=html)
