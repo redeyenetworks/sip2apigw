@@ -12,3 +12,6 @@ config.yaml
 lookups.yaml
 # Staging runtime (DB, logs, backups) — never part of the repo.
 var/
+
+# generated diagram renders (rebuilt by build/build_manual.py)
+docs/manual/assets/rendered/
