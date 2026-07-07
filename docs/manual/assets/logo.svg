@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 160" width="600" height="160" role="img" aria-label="RedEye sip2api Gateway">
+  <title>RedEye sip2api Gateway</title>
+  <desc>RedEye sip2api Gateway wordmark — a stylized red eye with a signal pulse, by RedEye Network Solutions.</desc>
+
+  <defs>
+    <linearGradient id="reGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#E11B3C"/>
+      <stop offset="1" stop-color="#C8102E"/>
+    </linearGradient>
+    <radialGradient id="reIris" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#E11B3C"/>
+      <stop offset="0.65" stop-color="#C8102E"/>
+      <stop offset="1" stop-color="#8E0A20"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ===== Eye / signal mark ===== -->
+  <g transform="translate(20 26)">
+    <!-- outer eye almond (charcoal) -->
+    <path d="M4 54 C34 8, 106 8, 136 54 C106 100, 34 100, 4 54 Z"
+          fill="none" stroke="#1F2933" stroke-width="7" stroke-linejoin="round"/>
+
+    <!-- iris -->
+    <circle cx="70" cy="54" r="30" fill="url(#reIris)"/>
+    <!-- pupil -->
+    <circle cx="70" cy="54" r="13" fill="#1F2933"/>
+    <!-- catchlight -->
+    <circle cx="62" cy="46" r="5" fill="#FFFFFF" opacity="0.9"/>
+
+    <!-- signal pulse crossing the iris (SIP in / page out) -->
+    <path d="M18 54 H46 L54 34 L66 78 L78 40 L88 62 H122"
+          fill="none" stroke="#FFFFFF" stroke-width="4.5"
+          stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>
+
+    <!-- broadcast arcs (page out) -->
+    <path d="M128 34 A34 34 0 0 1 128 74" fill="none" stroke="url(#reGlow)" stroke-width="4.5" stroke-linecap="round"/>
+    <path d="M140 26 A46 46 0 0 1 140 82" fill="none" stroke="url(#reGlow)" stroke-width="4.5" stroke-linecap="round" opacity="0.55"/>
+  </g>
+
+  <!-- ===== Wordmark ===== -->
+  <g font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif">
+    <!-- RedEye -->
+    <text x="215" y="70" font-size="46" font-weight="700" letter-spacing="-0.5">
+      <tspan fill="#1F2933">Red</tspan><tspan fill="#C8102E">Eye</tspan>
+    </text>
+    <!-- sip2api Gateway -->
+    <text x="216" y="104" font-size="27" font-weight="600" letter-spacing="0.3">
+      <tspan fill="#1F2933">sip</tspan><tspan fill="#C8102E">2</tspan><tspan fill="#1F2933">api</tspan><tspan fill="#52606D" font-weight="500"> Gateway</tspan>
+    </text>
+    <!-- divider -->
+    <rect x="217" y="118" width="360" height="2" fill="#C8102E" opacity="0.85"/>
+    <!-- subtitle -->
+    <text x="217" y="140" font-size="14.5" font-weight="500" letter-spacing="1.4" fill="#52606D">
+      CODE&#160;BLUE&#160;/&#160;RRT&#160;NOTIFICATION&#160;GATEWAY
+    </text>
+  </g>
+</svg>
